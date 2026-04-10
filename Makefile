@@ -6,7 +6,7 @@ include $(THEOS)/makefiles/common.mk
 
 TWEAK_NAME = VCAMClone VCAMCloneSB
 VCAMClone_FILES = Tweak.xm
-VCAMClone_CFLAGS = -fobjc-arc
+VCAMClone_CFLAGS = -fobjc-arc -Wno-unguarded-availability-new
 VCAMClone_FRAMEWORKS = Foundation AVFoundation CoreMedia CoreVideo CoreImage VideoToolbox UIKit
 VCAMClone_LIBRARIES = substrate
 VCAMClone_PLIST = VCAMClone.plist
