@@ -5,7 +5,7 @@
 #import <CoreImage/CoreImage.h>
 #import <QuartzCore/QuartzCore.h>
 #import <VideoToolbox/VideoToolbox.h>
-#import <UIKit/UIKit.h>
+#import <ImageIO/ImageIO.h>
 #import <objc/message.h>
 #import <notify.h>
 #import <substrate.h>
@@ -80,26 +80,33 @@ static int VCAMConnectWithTimeout(const char *host, int port, int timeoutSec) {
     return fd;
 }
 
-// ─── JPEG → CVPixelBufferRef (32BGRA) ────────────────────────────────────────
+// ─── JPEG → CVPixelBufferRef (32BGRA) — 纯 ImageIO，不依赖 UIKit ─────────────
 static CVPixelBufferRef VCAMCreatePixelBufferFromJPEGData(NSData *jpegData) {
-    UIImage *img = [UIImage imageWithData:jpegData];
-    if (!img || img.size.width <= 0 || img.size.height <= 0) return NULL;
+    if (!jpegData.length) return NULL;
 
-    size_t w = (size_t)img.size.width;
-    size_t h = (size_t)img.size.height;
+    CGDataProviderRef provider = CGDataProviderCreateWithCFData((__bridge CFDataRef)jpegData);
+    if (!provider) return NULL;
+
+    CGImageRef cgImage = CGImageCreateWithJPEGDataProvider(provider, NULL, false, kCGRenderingIntentDefault);
+    CGDataProviderRelease(provider);
+    if (!cgImage) return NULL;
+
+    size_t w = CGImageGetWidth(cgImage);
+    size_t h = CGImageGetHeight(cgImage);
+    if (w == 0 || h == 0) { CGImageRelease(cgImage); return NULL; }
 
     NSDictionary *attrs = @{
-        (id)kCVPixelBufferPixelFormatTypeKey:             @(kCVPixelFormatType_32BGRA),
-        (id)kCVPixelBufferIOSurfacePropertiesKey:         @{},
-        (id)kCVPixelBufferCGImageCompatibilityKey:        @YES,
-        (id)kCVPixelBufferCGBitmapContextCompatibilityKey:@YES,
+        (id)kCVPixelBufferPixelFormatTypeKey:              @(kCVPixelFormatType_32BGRA),
+        (id)kCVPixelBufferIOSurfacePropertiesKey:          @{},
+        (id)kCVPixelBufferCGImageCompatibilityKey:         @YES,
+        (id)kCVPixelBufferCGBitmapContextCompatibilityKey: @YES,
     };
 
     CVPixelBufferRef buf = NULL;
-    if (CVPixelBufferCreate(kCFAllocatorDefault, w, h,
-                            kCVPixelFormatType_32BGRA,
-                            (__bridge CFDictionaryRef)attrs, &buf) != kCVReturnSuccess || !buf)
-        return NULL;
+    if (CVPixelBufferCreate(kCFAllocatorDefault, w, h, kCVPixelFormatType_32BGRA,
+                            (__bridge CFDictionaryRef)attrs, &buf) != kCVReturnSuccess || !buf) {
+        CGImageRelease(cgImage); return NULL;
+    }
 
     CVPixelBufferLockBaseAddress(buf, 0);
     CGColorSpaceRef cs  = CGColorSpaceCreateDeviceRGB();
@@ -109,10 +116,11 @@ static CVPixelBufferRef VCAMCreatePixelBufferFromJPEGData(NSData *jpegData) {
         kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst);
     CGColorSpaceRelease(cs);
     if (ctx) {
-        CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), img.CGImage);
+        CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), cgImage);
         CGContextRelease(ctx);
     }
     CVPixelBufferUnlockBaseAddress(buf, 0);
+    CGImageRelease(cgImage);
     return buf;
 }
 
