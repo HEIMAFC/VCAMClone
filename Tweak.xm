@@ -186,67 +186,90 @@ static CIContext *VCAMSharedCIContext(void) {
 
 // ─── 原地覆写：把假画面像素直接写入真实 buffer 的内存 ─────────────────────────
 //
-//  策略：
-//  1. 若真实 buffer 为 32BGRA → CGBitmapContext 直接覆盖（零格式转换）
-//  2. 其他格式（NV12/YpCbCr…）→ CIContext render 到真实 buffer
-//     CIContext 原生处理 RGB→YCbCr 色彩空间，且直接写入原始 IOSurface
+//  比例策略：Aspect-Fill 居中裁切
+//    - 按目标宽高等比放大，使假画面能覆盖整个目标区域
+//    - 超出部分从中心裁去，避免拉伸和黑边
 //
-//  因为始终操作的是真实 buffer，其 IOSurface 标记、色彩矩阵、方向等
-//  附加属性（Attachments）全部自动保留，渲染管线不会察觉任何差异。
+//  路径 A (BGRA)   → CGBitmapContext 直接覆写，零格式转换
+//  路径 B (NV12…) → CIContext render:toCVPixelBuffer:bounds: 精确裁切渲染
+//                   渲染后 lock/unlock 强制 IOSurface 同步，防止录制时 buffer 被提前复用
 // ─────────────────────────────────────────────────────────────────────────────
 static BOOL VCAMReplacePixelsInPlace(CGImageRef fakeImage, CVPixelBufferRef realBuf) {
     if (!fakeImage || !realBuf) return NO;
 
+    size_t srcW   = CGImageGetWidth(fakeImage);
+    size_t srcH   = CGImageGetHeight(fakeImage);
     size_t dstW   = CVPixelBufferGetWidth(realBuf);
     size_t dstH   = CVPixelBufferGetHeight(realBuf);
     OSType dstFmt = CVPixelBufferGetPixelFormatType(realBuf);
+
+    if (!srcW || !srcH || !dstW || !dstH) return NO;
+
+    // Aspect-Fill：等比放大到刚好能覆盖目标尺寸
+    CGFloat fillScale = MAX((CGFloat)dstW / (CGFloat)srcW,
+                            (CGFloat)dstH / (CGFloat)srcH);
+    CGFloat scaledW   = srcW * fillScale;
+    CGFloat scaledH   = srcH * fillScale;
 
     static uint64_t sReplaceCount = 0;
     sReplaceCount++;
     if (sReplaceCount <= 5 || (sReplaceCount % 300) == 0)
         VCAMAppendMediaLog([NSString stringWithFormat:
-            @"replace#=%llu dst=%zux%zu dstFmt=%u",
-            (unsigned long long)sReplaceCount, dstW, dstH, (unsigned)dstFmt]);
+            @"replace#=%llu src=%zux%zu dst=%zux%zu fmt=%u scale=%.2f",
+            (unsigned long long)sReplaceCount, srcW, srcH, dstW, dstH,
+            (unsigned)dstFmt, fillScale]);
 
     if (dstFmt == kCVPixelFormatType_32BGRA || dstFmt == kCVPixelFormatType_32ARGB) {
-        // ── 路径 A：CGBitmapContext 直接覆写 BGRA 内存（最快，零格式转换）────
+        // ── 路径 A：CGBitmapContext 直接覆写 BGRA 内存 ────────────────────────
+        // drawRect 居中偏移，让放大后的图片中心对齐目标中心
+        CGRect drawRect = CGRectMake(
+            -(scaledW - (CGFloat)dstW) * 0.5,
+            -(scaledH - (CGFloat)dstH) * 0.5,
+            scaledW, scaledH);
+
         CVPixelBufferLockBaseAddress(realBuf, 0);
         CGColorSpaceRef cs  = CGColorSpaceCreateDeviceRGB();
         CGContextRef    ctx = CGBitmapContextCreate(
             CVPixelBufferGetBaseAddress(realBuf), dstW, dstH, 8,
             CVPixelBufferGetBytesPerRow(realBuf), cs,
-            kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst);
+            kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipLast);
         CGColorSpaceRelease(cs);
         if (ctx) {
-            CGContextDrawImage(ctx, CGRectMake(0, 0, dstW, dstH), fakeImage);
+            CGContextClipToRect(ctx, CGRectMake(0, 0, (CGFloat)dstW, (CGFloat)dstH));
+            CGContextDrawImage(ctx, drawRect, fakeImage);
             CGContextRelease(ctx);
         }
         CVPixelBufferUnlockBaseAddress(realBuf, 0);
-        if (sReplaceCount <= 5) VCAMAppendMediaLog(@"replace path A (BGRA CGCtx) ok");
+        if (sReplaceCount <= 5) VCAMAppendMediaLog(@"replace A (BGRA) ok");
         return YES;
     }
 
-    // ── 路径 B：CIContext 渲染到真实 buffer（处理 NV12/YpCbCr 等所有格式）──
+    // ── 路径 B：CIContext 渲染到 NV12/YpCbCr 等格式 ──────────────────────────
     @autoreleasepool {
         CIImage *ci = [CIImage imageWithCGImage:fakeImage];
-        if (!ci) {
-            if (sReplaceCount <= 5) VCAMAppendMediaLog(@"CIImage from CGImage failed");
-            return NO;
-        }
+        if (!ci) { if (sReplaceCount <= 5) VCAMAppendMediaLog(@"CIImage nil"); return NO; }
+
         CIContext *ctx = VCAMSharedCIContext();
-        if (!ctx) {
-            if (sReplaceCount <= 5) VCAMAppendMediaLog(@"CIContext nil");
-            return NO;
-        }
-        // 缩放到目标尺寸
-        size_t srcW = (size_t)CGImageGetWidth(fakeImage);
-        size_t srcH = (size_t)CGImageGetHeight(fakeImage);
-        CIImage *scaled = (srcW == dstW && srcH == dstH) ? ci :
-            [ci imageByApplyingTransform:
-                CGAffineTransformMakeScale((CGFloat)dstW / srcW, (CGFloat)dstH / srcH)];
-        // 直接渲染进真实 buffer（保留原有 IOSurface 和 Attachment）
-        [ctx render:scaled toCVPixelBuffer:realBuf];
-        if (sReplaceCount <= 5) VCAMAppendMediaLog(@"replace path B (CIContext) ok");
+        if (!ctx) { if (sReplaceCount <= 5) VCAMAppendMediaLog(@"CIContext nil"); return NO; }
+
+        // 先等比放大
+        CIImage *scaled = [ci imageByApplyingTransform:
+            CGAffineTransformMakeScale(fillScale, fillScale)];
+
+        // bounds：在已放大的 CIImage 坐标系里居中取 dstW×dstH 的区域
+        // render:toCVPixelBuffer:bounds: 会把该区域自动填满整个 pixel buffer
+        CGRect cropRect = CGRectMake(
+            (scaledW - (CGFloat)dstW) * 0.5,
+            (scaledH - (CGFloat)dstH) * 0.5,
+            (CGFloat)dstW, (CGFloat)dstH);
+
+        [ctx render:scaled toCVPixelBuffer:realBuf bounds:cropRect colorSpace:nil];
+
+        // IOSurface 同步：强制等待 GPU 写完，防止视频录制 buffer 提前被回收导致卡帧
+        CVPixelBufferLockBaseAddress(realBuf, kCVPixelBufferLock_ReadOnly);
+        CVPixelBufferUnlockBaseAddress(realBuf, kCVPixelBufferLock_ReadOnly);
+
+        if (sReplaceCount <= 5) VCAMAppendMediaLog(@"replace B (CIContext) ok");
         return YES;
     }
 }
