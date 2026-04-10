@@ -245,6 +245,12 @@ static BOOL VCAMReplacePixelsInPlace(CGImageRef fakeImage, CVPixelBufferRef real
     }
 
     // ── 路径 B：CIContext 渲染到 NV12/YpCbCr 等格式 ──────────────────────────
+    //
+    //  注意：render:toCVPixelBuffer:bounds: 中 bounds 是"渲染到 buffer 的哪个区域"
+    //  而非"取源图像的哪个区域"，用错会导致只有一半 buffer 被覆写（分割线 bug）。
+    //  正确做法：先把 CIImage crop+translate 成 extent=(0,0,dstW,dstH)，
+    //  再用无 bounds 形式的 render:toCVPixelBuffer: 填满整个 buffer。
+    // ─────────────────────────────────────────────────────────────────────────
     @autoreleasepool {
         CIImage *ci = [CIImage imageWithCGImage:fakeImage];
         if (!ci) { if (sReplaceCount <= 5) VCAMAppendMediaLog(@"CIImage nil"); return NO; }
@@ -252,20 +258,25 @@ static BOOL VCAMReplacePixelsInPlace(CGImageRef fakeImage, CVPixelBufferRef real
         CIContext *ctx = VCAMSharedCIContext();
         if (!ctx) { if (sReplaceCount <= 5) VCAMAppendMediaLog(@"CIContext nil"); return NO; }
 
-        // 先等比放大
+        // 1. 等比放大到覆盖目标
         CIImage *scaled = [ci imageByApplyingTransform:
             CGAffineTransformMakeScale(fillScale, fillScale)];
 
-        // bounds：在已放大的 CIImage 坐标系里居中取 dstW×dstH 的区域
-        // render:toCVPixelBuffer:bounds: 会把该区域自动填满整个 pixel buffer
+        // 2. 居中裁切：在放大后的坐标系里取中心 dstW×dstH
         CGRect cropRect = CGRectMake(
             (scaledW - (CGFloat)dstW) * 0.5,
             (scaledH - (CGFloat)dstH) * 0.5,
             (CGFloat)dstW, (CGFloat)dstH);
+        CIImage *cropped = [scaled imageByCroppingToRect:cropRect];
 
-        [ctx render:scaled toCVPixelBuffer:realBuf bounds:cropRect colorSpace:nil];
+        // 3. 平移到 extent 原点 (0,0)，确保 render:toCVPixelBuffer: 填满整个 buffer
+        CIImage *positioned = [cropped imageByApplyingTransform:
+            CGAffineTransformMakeTranslation(-cropRect.origin.x, -cropRect.origin.y)];
 
-        // IOSurface 同步：强制等待 GPU 写完，防止视频录制 buffer 提前被回收导致卡帧
+        // 4. 渲染（extent 已是 (0,0,dstW,dstH)，精确覆盖整个 buffer）
+        [ctx render:positioned toCVPixelBuffer:realBuf];
+
+        // 5. IOSurface 同步：确保 GPU 写完再返回，防止录制 buffer 提前复用
         CVPixelBufferLockBaseAddress(realBuf, kCVPixelBufferLock_ReadOnly);
         CVPixelBufferUnlockBaseAddress(realBuf, kCVPixelBufferLock_ReadOnly);
 
