@@ -223,6 +223,30 @@ static CIContext *VCAMSharedCIContext(void) {
     return sCtx;
 }
 
+// ─── 检测 CVPixelBuffer 是否为全黑（所有字节接近 0）─────────────────────────
+static BOOL VCAMPixelBufferIsBlank(CVPixelBufferRef buf) {
+    if (!buf) return YES;
+    CVPixelBufferLockBaseAddress(buf, kCVPixelBufferLock_ReadOnly);
+    size_t planeCount = CVPixelBufferGetPlaneCount(buf);
+    uint8_t *data;
+    size_t   bytes;
+    if (planeCount > 0) {
+        data  = CVPixelBufferGetBaseAddressOfPlane(buf, 0);
+        bytes = CVPixelBufferGetBytesPerRowOfPlane(buf, 0)
+              * CVPixelBufferGetHeightOfPlane(buf, 0);
+    } else {
+        data  = CVPixelBufferGetBaseAddress(buf);
+        bytes = CVPixelBufferGetBytesPerRow(buf) * CVPixelBufferGetHeight(buf);
+    }
+    BOOL blank = YES;
+    size_t check = MIN(bytes, 512);
+    for (size_t i = 0; i < check; i += 8) {
+        if (data[i] > 3) { blank = NO; break; }
+    }
+    CVPixelBufferUnlockBaseAddress(buf, kCVPixelBufferLock_ReadOnly);
+    return blank;
+}
+
 // ─── Scale / convert fake frame to match original format exactly ──────────────
 static CVPixelBufferRef VCAMCreateRenderedImageMatchingOriginal(
         CVPixelBufferRef sourceImage, CVPixelBufferRef originalImage) {
@@ -237,7 +261,6 @@ static CVPixelBufferRef VCAMCreateRenderedImageMatchingOriginal(
     OSType dstFmt = CVPixelBufferGetPixelFormatType(originalImage);
     if (!dstW || !dstH) return NULL;
 
-    // Log 首帧 + 每 300 帧，方便排查格式/尺寸问题
     static uint64_t sRenderCount = 0;
     sRenderCount++;
     if (sRenderCount <= 5 || (sRenderCount % 300) == 0)
@@ -261,42 +284,54 @@ static CVPixelBufferRef VCAMCreateRenderedImageMatchingOriginal(
 
     BOOL ok = NO;
 
-    // ── 路径 1：VTPixelTransferSession（硬件快速路径）──────────────────────────
-    VTPixelTransferSessionRef session = VCAMSharedPixelTransferSession();
-    if (session) {
-        OSStatus st = VTPixelTransferSessionTransferImage(session, sourceImage, target);
-        if (st == noErr) {
-            ok = YES;
-        } else {
-            VCAMAppendMediaLog([NSString stringWithFormat:
-                @"VT transfer st=%d srcFmt=%u->dstFmt=%u %zux%zu->%zux%zu",
-                (int)st, (unsigned)srcFmt, (unsigned)dstFmt, srcW, srcH, dstW, dstH]);
+    // ── 路径 1：CIContext（主路径，Metal 加速，原生处理 BGRA→NV12 色彩空间）──
+    @autoreleasepool {
+        CIImage *ci = [CIImage imageWithCVPixelBuffer:sourceImage];
+        if (ci) {
+            CIContext *ctx = VCAMSharedCIContext();
+            if (ctx) {
+                CIImage *scaled = (srcW == dstW && srcH == dstH) ? ci :
+                    [ci imageByApplyingTransform:
+                        CGAffineTransformMakeScale((CGFloat)dstW / (CGFloat)srcW,
+                                                   (CGFloat)dstH / (CGFloat)srcH)];
+                [ctx render:scaled toCVPixelBuffer:target];
+                // 验证输出不是全黑（VTPixelTransferSession 有时 noErr 但输出全零）
+                if (!VCAMPixelBufferIsBlank(target)) {
+                    ok = YES;
+                    if (sRenderCount <= 5)
+                        VCAMAppendMediaLog(@"CIContext render ok non-blank");
+                } else {
+                    if (sRenderCount <= 5)
+                        VCAMAppendMediaLog(@"CIContext render blank, trying VT");
+                }
+            } else if (sRenderCount <= 5) {
+                VCAMAppendMediaLog(@"CIContext nil");
+            }
+        } else if (sRenderCount <= 5) {
+            VCAMAppendMediaLog(@"CIImage from source nil");
         }
     }
 
-    // ── 路径 2：CIContext 软件备用（BGRA→NV12 VT 失败时走这条）───────────────
+    // ── 路径 2：VTPixelTransferSession 备用 ──────────────────────────────────
     if (!ok) {
-        @autoreleasepool {
-            CIImage *ci = [CIImage imageWithCVPixelBuffer:sourceImage];
-            if (ci) {
-                CIContext *ctx = VCAMSharedCIContext();
-                if (ctx) {
-                    // 缩放到目标分辨率（CIImage 坐标原点在左下角，scale 即可）
-                    CIImage *scaled = (srcW == dstW && srcH == dstH) ? ci :
-                        [ci imageByApplyingTransform:
-                            CGAffineTransformMakeScale((CGFloat)dstW / (CGFloat)srcW,
-                                                       (CGFloat)dstH / (CGFloat)srcH)];
-                    [ctx render:scaled toCVPixelBuffer:target];
-                    ok = YES;
-                    if (sRenderCount <= 5)
-                        VCAMAppendMediaLog(@"CIContext render ok");
-                }
+        VTPixelTransferSessionRef session = VCAMSharedPixelTransferSession();
+        if (session) {
+            OSStatus st = VTPixelTransferSessionTransferImage(session, sourceImage, target);
+            if (st == noErr && !VCAMPixelBufferIsBlank(target)) {
+                ok = YES;
+                if (sRenderCount <= 5)
+                    VCAMAppendMediaLog(@"VT transfer ok non-blank");
+            } else {
+                VCAMAppendMediaLog([NSString stringWithFormat:
+                    @"VT transfer st=%d blank=%d srcFmt=%u->dstFmt=%u",
+                    (int)st, (int)VCAMPixelBufferIsBlank(target),
+                    (unsigned)srcFmt, (unsigned)dstFmt]);
             }
         }
     }
 
     if (!ok) {
-        VCAMAppendMediaLog(@"both VT and CIContext failed, dropping frame");
+        VCAMAppendMediaLog(@"all paths failed or blank, pass-through original");
         CVPixelBufferRelease(target);
         return NULL;
     }
@@ -305,7 +340,7 @@ static CVPixelBufferRef VCAMCreateRenderedImageMatchingOriginal(
     if (att) { CVBufferSetAttachments(target, att, kCVAttachmentMode_ShouldPropagate); CFRelease(att); }
 
     VCAMRememberRenderedFrame(target);
-    CVPixelBufferRelease(target); // cache 持有 +1，返回 +0（与 CMSampleBufferGetImageBuffer 语义一致）
+    CVPixelBufferRelease(target); // cache 持有 +1，返回 +0
     return target;
 }
 
@@ -316,16 +351,20 @@ static CVImageBufferRef VCAMHookedCMSampleBufferGetImageBuffer(CMSampleBufferRef
     CVImageBufferRef originalImage = gOrigCMSampleBufferGetImageBuffer(sampleBuffer);
     CVImageBufferRef latestImage   = [VCAMManager copyLatestImageBuffer];
     gVCAMHookProbeCount++;
+
+    // 前 5 次 + 每 300 次记录一次，确认 hook 在触发
+    if (gVCAMHookProbeCount <= 5 || (gVCAMHookProbeCount % 300) == 0)
+        VCAMAppendMediaLog([NSString stringWithFormat:
+            @"hook probe=%llu origImg=%s latestImg=%s",
+            (unsigned long long)gVCAMHookProbeCount,
+            originalImage ? "yes" : "null",
+            latestImage   ? "yes" : "null"]);
+
     if (latestImage && originalImage) {
         CVPixelBufferRef rendered = VCAMCreateRenderedImageMatchingOriginal(
             (CVPixelBufferRef)latestImage, (CVPixelBufferRef)originalImage);
         CFRelease(latestImage);
-        if (rendered) {
-            if ((gVCAMHookProbeCount % 180) == 0)
-                VCAMAppendMediaLog([NSString stringWithFormat:
-                    @"hook probe=%llu enabled=1 hasFrame=1", (unsigned long long)gVCAMHookProbeCount]);
-            return rendered;
-        }
+        if (rendered) return rendered;
     } else if (latestImage) {
         CFRelease(latestImage);
     }
