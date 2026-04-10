@@ -1,6 +1,6 @@
 Package: com.vcam.clone.rootless
 Name: VCAM Clone Rootless
-Version: 2.0.2
+Version: 2.0.3
 Architecture: iphoneos-arm64
 Description: Virtual camera tweak — MJPEG over TCP (len32be + JPEG), global camera replacement
 Maintainer: VCAM Clone
