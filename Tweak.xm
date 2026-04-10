@@ -203,11 +203,24 @@ static VTPixelTransferSessionRef VCAMSharedPixelTransferSession(void) {
             VTSessionSetProperty(s, kVTPixelTransferPropertyKey_RealTime,    kCFBooleanTrue);
             VTSessionSetProperty(s, kVTPixelTransferPropertyKey_ScalingMode, kVTScalingMode_Normal);
             gVCAMPixelTransferSession = s;
+            VCAMAppendMediaLog(@"VTPixelTransferSession created ok");
         } else {
-            VCAMAppendMediaLog(@"pixel transfer session create failed");
+            VCAMAppendMediaLog(@"VTPixelTransferSession create failed — will use CIContext");
         }
     });
     return gVCAMPixelTransferSession;
+}
+
+// ─── Shared CIContext (fallback when VTPixelTransferSession fails) ─────────────
+static CIContext *VCAMSharedCIContext(void) {
+    static CIContext *sCtx = nil;
+    static dispatch_once_t tok;
+    dispatch_once(&tok, ^{
+        // nil options → system picks best renderer (Metal when available)
+        sCtx = [CIContext contextWithOptions:nil];
+        VCAMAppendMediaLog(sCtx ? @"CIContext created ok" : @"CIContext create failed");
+    });
+    return sCtx;
 }
 
 // ─── Scale / convert fake frame to match original format exactly ──────────────
@@ -216,43 +229,83 @@ static CVPixelBufferRef VCAMCreateRenderedImageMatchingOriginal(
 
     if (!sourceImage || !originalImage) return NULL;
 
-    size_t dstW  = CVPixelBufferGetWidth(originalImage);
-    size_t dstH  = CVPixelBufferGetHeight(originalImage);
+    size_t srcW   = CVPixelBufferGetWidth(sourceImage);
+    size_t srcH   = CVPixelBufferGetHeight(sourceImage);
+    size_t dstW   = CVPixelBufferGetWidth(originalImage);
+    size_t dstH   = CVPixelBufferGetHeight(originalImage);
+    OSType srcFmt = CVPixelBufferGetPixelFormatType(sourceImage);
     OSType dstFmt = CVPixelBufferGetPixelFormatType(originalImage);
     if (!dstW || !dstH) return NULL;
 
+    // Log 首帧 + 每 300 帧，方便排查格式/尺寸问题
+    static uint64_t sRenderCount = 0;
+    sRenderCount++;
+    if (sRenderCount <= 5 || (sRenderCount % 300) == 0)
+        VCAMAppendMediaLog([NSString stringWithFormat:
+            @"render#=%llu src=%zux%zu srcFmt=%u dst=%zux%zu dstFmt=%u",
+            (unsigned long long)sRenderCount, srcW, srcH, (unsigned)srcFmt,
+            dstW, dstH, (unsigned)dstFmt]);
+
     NSDictionary *attrs = @{
-        (id)kCVPixelBufferPixelFormatTypeKey: @(dstFmt),
+        (id)kCVPixelBufferPixelFormatTypeKey:     @(dstFmt),
         (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
     };
     CVPixelBufferRef target = NULL;
-    CVReturn err = CVPixelBufferCreate(kCFAllocatorDefault, dstW, dstH, dstFmt,
-                                       (__bridge CFDictionaryRef)attrs, &target);
-    if (err != kCVReturnSuccess || !target) {
+    CVReturn cerr = CVPixelBufferCreate(kCFAllocatorDefault, dstW, dstH, dstFmt,
+                                        (__bridge CFDictionaryRef)attrs, &target);
+    if (cerr != kCVReturnSuccess || !target) {
         VCAMAppendMediaLog([NSString stringWithFormat:
-            @"target buf create failed err=%d fmt=%u %zux%zu", (int)err, dstFmt, dstW, dstH]);
+            @"target create failed cerr=%d fmt=%u %zux%zu", (int)cerr, dstFmt, dstW, dstH]);
         return NULL;
     }
 
-    VTPixelTransferSessionRef session = VCAMSharedPixelTransferSession();
-    if (!session) { CVPixelBufferRelease(target); return NULL; }
+    BOOL ok = NO;
 
-    OSStatus st = VTPixelTransferSessionTransferImage(session, sourceImage, target);
-    if (st != noErr) {
-        VCAMAppendMediaLog([NSString stringWithFormat:
-            @"pixel transfer failed st=%d srcFmt=%u dstFmt=%u src=%zux%zu dst=%zux%zu",
-            (int)st,
-            (unsigned)CVPixelBufferGetPixelFormatType(sourceImage), (unsigned)dstFmt,
-            CVPixelBufferGetWidth(sourceImage), CVPixelBufferGetHeight(sourceImage),
-            dstW, dstH]);
-        CVPixelBufferRelease(target); return NULL;
+    // ── 路径 1：VTPixelTransferSession（硬件快速路径）──────────────────────────
+    VTPixelTransferSessionRef session = VCAMSharedPixelTransferSession();
+    if (session) {
+        OSStatus st = VTPixelTransferSessionTransferImage(session, sourceImage, target);
+        if (st == noErr) {
+            ok = YES;
+        } else {
+            VCAMAppendMediaLog([NSString stringWithFormat:
+                @"VT transfer st=%d srcFmt=%u->dstFmt=%u %zux%zu->%zux%zu",
+                (int)st, (unsigned)srcFmt, (unsigned)dstFmt, srcW, srcH, dstW, dstH]);
+        }
+    }
+
+    // ── 路径 2：CIContext 软件备用（BGRA→NV12 VT 失败时走这条）───────────────
+    if (!ok) {
+        @autoreleasepool {
+            CIImage *ci = [CIImage imageWithCVPixelBuffer:sourceImage];
+            if (ci) {
+                CIContext *ctx = VCAMSharedCIContext();
+                if (ctx) {
+                    // 缩放到目标分辨率（CIImage 坐标原点在左下角，scale 即可）
+                    CIImage *scaled = (srcW == dstW && srcH == dstH) ? ci :
+                        [ci imageByApplyingTransform:
+                            CGAffineTransformMakeScale((CGFloat)dstW / (CGFloat)srcW,
+                                                       (CGFloat)dstH / (CGFloat)srcH)];
+                    [ctx render:scaled toCVPixelBuffer:target];
+                    ok = YES;
+                    if (sRenderCount <= 5)
+                        VCAMAppendMediaLog(@"CIContext render ok");
+                }
+            }
+        }
+    }
+
+    if (!ok) {
+        VCAMAppendMediaLog(@"both VT and CIContext failed, dropping frame");
+        CVPixelBufferRelease(target);
+        return NULL;
     }
 
     CFDictionaryRef att = CVBufferCopyAttachments(originalImage, kCVAttachmentMode_ShouldPropagate);
     if (att) { CVBufferSetAttachments(target, att, kCVAttachmentMode_ShouldPropagate); CFRelease(att); }
 
     VCAMRememberRenderedFrame(target);
-    CVPixelBufferRelease(target); // cache holds +1, return +0 (same semantics as CMSampleBufferGetImageBuffer)
+    CVPixelBufferRelease(target); // cache 持有 +1，返回 +0（与 CMSampleBufferGetImageBuffer 语义一致）
     return target;
 }
 
