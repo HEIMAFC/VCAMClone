@@ -1,0 +1,41 @@
+name: Build VCAMClone
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install ldid
+        run: brew install ldid
+
+      - name: Setup Theos
+        run: |
+          set -e
+          export THEOS=$HOME/theos
+          echo "THEOS=$HOME/theos" >> $GITHUB_ENV
+          echo "$HOME/theos/bin" >> $GITHUB_PATH
+
+          git clone --recursive https://github.com/theos/theos.git $THEOS
+
+          mkdir -p $THEOS/sdks
+          curl -L --retry 3 \
+            https://github.com/theos/sdks/releases/download/master-146e41f/iPhoneOS15.6.sdk.tar.xz \
+            | tar -xJf - -C $THEOS/sdks/
+
+      - name: Build package
+        run: make package FINALPACKAGE=1
+
+      - name: Upload deb artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: VCAMClone-deb
+          path: packages/*.deb
+          retention-days: 7
