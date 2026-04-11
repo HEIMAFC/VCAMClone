@@ -242,8 +242,8 @@ static BOOL VCAMReplacePixelsInPlace(CGImageRef fakeImage, CVPixelBufferRef real
             if (needsRotation) {
                 // 1. 平移原点至画布中心
                 CGContextTranslateCTM(ctx, (CGFloat)dstW / 2.0, (CGFloat)dstH / 2.0);
-                // 2. 旋转 -90°（若照片方向仍反，改为 +M_PI_2）
-                CGContextRotateCTM(ctx, -M_PI_2);
+                // 2. 旋转 +90°（CG 底部原点→内存顶部原点隐式翻转后为 CW，正好抵消系统 EXIF CCW）
+                CGContextRotateCTM(ctx, M_PI_2);
                 // 3. 旋转后有效画布为 dstH 宽 × dstW 高（竖向坐标系），按此做 Aspect-Fill
                 CGFloat fill = MAX((CGFloat)dstH / (CGFloat)srcW,
                                    (CGFloat)dstW / (CGFloat)srcH);
@@ -276,8 +276,8 @@ static BOOL VCAMReplacePixelsInPlace(CGImageRef fakeImage, CVPixelBufferRef real
         if (!ctx) { if (sReplaceCount <= 5) VCAMAppendMediaLog(@"CIContext nil"); return NO; }
 
         if (needsRotation) {
-            // 旋转 -90° 补偿横向传感器方向附件
-            ci = [ci imageByApplyingTransform:CGAffineTransformMakeRotation(-M_PI_2)];
+            // 旋转 +90° 补偿横向传感器方向附件（与路径 A 方向一致）
+            ci = [ci imageByApplyingTransform:CGAffineTransformMakeRotation(M_PI_2)];
             // 归一化原点到 (0, 0)
             CGRect ext = ci.extent;
             if (ext.origin.x != 0 || ext.origin.y != 0)
