@@ -667,8 +667,12 @@ OBJC_EXTERN UIImage *UIGetScreenImage(void) __attribute__((weak_import));
         CGContextRef ctx = UIGraphicsGetCurrentContext();
         if (ctx) {
             CGContextTranslateCTM(ctx, -cx, -cy);
-            for (UIWindow *w in [[UIApplication sharedApplication] windows])
-                [w drawViewHierarchyInRect:CGRectMake(0, 0, screenW, screenH) afterScreenUpdates:NO];
+            // 使用 UIWindowScene.windows（iOS 13+ 正式 API，规避 UIApplication.windows 的 iOS 15 弃用警告）
+            for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+                if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+                for (UIWindow *w in ((UIWindowScene *)scene).windows)
+                    [w drawViewHierarchyInRect:CGRectMake(0, 0, screenW, screenH) afterScreenUpdates:NO];
+            }
         }
         UIImage *snap = UIGraphicsGetImageFromCurrentImageContext();
         UIGraphicsEndImageContext();
