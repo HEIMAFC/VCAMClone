@@ -8,6 +8,7 @@
 #import <objc/message.h>
 #import <notify.h>
 #import <math.h>
+#import <dlfcn.h>
 #import <arpa/inet.h>
 #import <sys/socket.h>
 #import <sys/types.h>
@@ -553,8 +554,14 @@ static void VCAMSBSetSampleAttachments(CMSampleBufferRef sample) {
 //  屏幕截图优先使用私有 API UIGetScreenImage（可抓全屏含前台 App），
 //  不可用时回退到 drawViewHierarchyInRect:（仅限 SpringBoard 自身 UI）。
 // ─────────────────────────────────────────────────────────────────────────────
-// 弱引用私有 API，可安全用于任意 iOS 版本
-OBJC_EXTERN UIImage *UIGetScreenImage(void) __attribute__((weak_import));
+// 运行时动态查找私有 API（避免链接期 undefined symbol）
+typedef UIImage *(*_VCAMUIGetScreenImageFn)(void);
+static _VCAMUIGetScreenImageFn _VCAMUIGetScreenImage(void) {
+    static _VCAMUIGetScreenImageFn fn = NULL;
+    static dispatch_once_t tok;
+    dispatch_once(&tok, ^{ fn = (_VCAMUIGetScreenImageFn)dlsym(RTLD_DEFAULT, "UIGetScreenImage"); });
+    return fn;
+}
 
 @interface VCAMColorPickerSender : NSObject
 + (instancetype)shared;
@@ -642,10 +649,11 @@ OBJC_EXTERN UIImage *UIGetScreenImage(void) __attribute__((weak_import));
     uint8_t pixels[10 * 10 * 4];
     memset(pixels, 0, sizeof(pixels));
 
-    // 优先：UIGetScreenImage 抓取全屏合成图（含前台 App）
+    // 优先：UIGetScreenImage 抓取全屏合成图（含前台 App），运行时 dlsym 查找
     BOOL captured = NO;
-    if (&UIGetScreenImage != NULL) {
-        UIImage *full = UIGetScreenImage();
+    _VCAMUIGetScreenImageFn fnGetScreen = _VCAMUIGetScreenImage();
+    if (fnGetScreen) {
+        UIImage *full = fnGetScreen();
         if (full && full.CGImage) {
             CGFloat scale = full.scale > 0 ? full.scale : 1.0;
             CGRect cropPx = CGRectMake(cx * scale, cy * scale, 10 * scale, 10 * scale);
