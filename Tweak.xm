@@ -5,6 +5,7 @@
 #import <CoreImage/CoreImage.h>
 #import <QuartzCore/QuartzCore.h>
 #import <ImageIO/ImageIO.h>
+#import <VideoToolbox/VideoToolbox.h>
 #import <objc/message.h>
 #import <notify.h>
 #import <substrate.h>
@@ -25,6 +26,12 @@ static const char *kVCAMMediaNotify        = "com.vcam.media.stream.recv";
 static CVImageBufferRef (*gOrigCMSampleBufferGetImageBuffer)(CMSampleBufferRef sampleBuffer) = NULL;
 static CFTimeInterval  gVCAMLastManagerSyncAt  = 0;
 static uint64_t        gVCAMHookProbeCount     = 0;
+
+// VTCompressionSessionEncodeFrame hook — 拦截视频录制编码帧（AVCaptureMovieFileOutput 路径）
+typedef OSStatus (*VTEncodeFrameIMP)(VTCompressionSessionRef, CVImageBufferRef,
+                                     CMTime, CMTime, CFDictionaryRef, void *, VTEncodeInfoFlags *);
+static VTEncodeFrameIMP gOrigVTEncodeFrame = NULL;
+static uint64_t         gVTEncodeFrameCount = 0;
 
 // ─── TCP helpers ──────────────────────────────────────────────────────────────
 static BOOL VCAMReadExact(int fd, void *buffer, size_t length) {
@@ -666,6 +673,39 @@ static CVImageBufferRef VCAMHookedCMSampleBufferGetImageBuffer(CMSampleBufferRef
 + (CGImageRef)copyLatestCGImage             { return [[VCAMService shared] copyLatestCGImage]; }
 @end
 
+// ─── VTCompressionSessionEncodeFrame hook ────────────────────────────────────
+//
+//  AVCaptureMovieFileOutput 录像时，视频帧直接以 CVImageBufferRef 传入 VideoToolbox
+//  编码器，完全不经过 CMSampleBufferGetImageBuffer，因此上面的 hook 对录像无效。
+//  在此截获编码入口，原地覆写像素后再交给原始编码器，录像内容同样替换为网络图像。
+//
+// ─────────────────────────────────────────────────────────────────────────────
+static OSStatus VCAMHookedVTCompressionSessionEncodeFrame(
+    VTCompressionSessionRef session,
+    CVImageBufferRef        imageBuffer,
+    CMTime                  pts,
+    CMTime                  duration,
+    CFDictionaryRef         properties,
+    void                   *sourceRef,
+    VTEncodeInfoFlags      *flags)
+{
+    if (imageBuffer) {
+        CGImageRef fake = [VCAMManager copyLatestCGImage]; // +1
+        if (fake) {
+            VCAMReplacePixelsInPlace(fake, (CVPixelBufferRef)imageBuffer);
+            CGImageRelease(fake);
+        }
+        gVTEncodeFrameCount++;
+        if (gVTEncodeFrameCount <= 5 || (gVTEncodeFrameCount % 300) == 0)
+            VCAMAppendMediaLog([NSString stringWithFormat:
+                @"VTEncode#=%llu w=%zu h=%zu",
+                (unsigned long long)gVTEncodeFrameCount,
+                CVPixelBufferGetWidth((CVPixelBufferRef)imageBuffer),
+                CVPixelBufferGetHeight((CVPixelBufferRef)imageBuffer)]);
+    }
+    return gOrigVTEncodeFrame(session, imageBuffer, pts, duration, properties, sourceRef, flags);
+}
+
 // ─── Constructor ──────────────────────────────────────────────────────────────
 %ctor {
     @autoreleasepool {
@@ -676,6 +716,13 @@ static CVImageBufferRef VCAMHookedCMSampleBufferGetImageBuffer(CMSampleBufferRef
                            (void *)VCAMHookedCMSampleBufferGetImageBuffer,
                            (void **)&gOrigCMSampleBufferGetImageBuffer);
             VCAMAppendProcessLog([NSString stringWithFormat:@"hook CMSampleBufferGetImageBuffer process=%@", proc]);
+        }
+        // 视频录制路径：AVCaptureMovieFileOutput → VTCompressionSessionEncodeFrame（不经过上面的 hook）
+        if (!gOrigVTEncodeFrame) {
+            MSHookFunction((void *)VTCompressionSessionEncodeFrame,
+                           (void *)VCAMHookedVTCompressionSessionEncodeFrame,
+                           (void **)&gOrigVTEncodeFrame);
+            VCAMAppendProcessLog([NSString stringWithFormat:@"hook VTCompressionSessionEncodeFrame process=%@", proc]);
         }
         [[VCAMService shared] startObserver];
         [[VCAMService shared] applyConfig];
