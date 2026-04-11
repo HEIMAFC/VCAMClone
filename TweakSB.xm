@@ -21,7 +21,9 @@ static const char *kVCAMConfigNotify  = "com.vcam.stream.config";
 static const char *kVCAMMediaNotify   = "com.vcam.media.stream.recv";
 static const char *kVCAMReloadNotify  = "com.vcam.notify.reload";
 static const char *kVCAMShowUINotify  = "com.vcam.showui";
-static const char *kVCAMShowUIAckNotify = "com.vcam.showui.ack";
+static const char *kVCAMShowUIAckNotify        = "com.vcam.showui.ack";
+static const char *kVCAMColorPickerToggleNotify = "com.vcam.colorpicker.toggle";
+static const int   kVCAMColorPickerPort         = 7879;
 
 static BOOL           gProcessIsSpringBoard      = NO;
 static BOOL           gIsPresentingControlUI     = NO;
@@ -544,6 +546,194 @@ static void VCAMSBSetSampleAttachments(CMSampleBufferRef sample) {
 
 @end
 
+// ─── VCAMColorPickerSender ────────────────────────────────────────────────────
+//  以 15 FPS 抓取屏幕中心 10×10 区域平均 RGB，通过独立 TCP 连接推送到 PC 7879 端口。
+//  PC 实时将背景色更新为相同颜色，形成光学闭环以对抗活体检测屏幕闪色机制。
+//
+//  屏幕截图优先使用私有 API UIGetScreenImage（可抓全屏含前台 App），
+//  不可用时回退到 drawViewHierarchyInRect:（仅限 SpringBoard 自身 UI）。
+// ─────────────────────────────────────────────────────────────────────────────
+// 弱引用私有 API，可安全用于任意 iOS 版本
+OBJC_EXTERN UIImage *UIGetScreenImage(void) __attribute__((weak_import));
+
+@interface VCAMColorPickerSender : NSObject
++ (instancetype)shared;
+- (void)toggle;
+@property (nonatomic, readonly) BOOL running;
+@end
+
+@implementation VCAMColorPickerSender {
+    CADisplayLink    *_displayLink;
+    dispatch_queue_t  _tcpQueue;
+    int               _sockFD;
+    BOOL              _running;
+    NSString         *_host;
+}
+
++ (instancetype)shared {
+    static VCAMColorPickerSender *inst = nil;
+    static dispatch_once_t tok;
+    dispatch_once(&tok, ^{ inst = [[VCAMColorPickerSender alloc] init]; });
+    return inst;
+}
+
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        _sockFD   = -1;
+        _tcpQueue = dispatch_queue_create("com.vcam.colorpicker.tcp", DISPATCH_QUEUE_SERIAL);
+    }
+    return self;
+}
+
+- (BOOL)running { return _running; }
+
+- (void)toggle {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (self->_running) [self _stop];
+        else                [self _start];
+    });
+}
+
+- (void)_start {
+    if (_running) return;
+    NSDictionary *cfg = VCAMLoadRawConfig();
+    NSString *host = [cfg[@"host"] isKindOfClass:[NSString class]] ? cfg[@"host"] : @"127.0.0.1";
+    host = [[host stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]]
+               stringByReplacingOccurrencesOfString:@"\u3002" withString:@"."];
+    if (!host.length || [host isEqualToString:@"localhost"]) host = @"127.0.0.1";
+    _host    = [host copy];
+    _running = YES;
+
+    if (!_displayLink) {
+        _displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(_tick:)];
+        _displayLink.preferredFramesPerSecond = 15;
+    }
+    [_displayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+    _displayLink.paused = NO;
+    VCAMAppendSBLog([NSString stringWithFormat:@"colorpicker start host=%@ port=%d", _host, kVCAMColorPickerPort]);
+}
+
+- (void)_stop {
+    if (!_running) return;
+    _running = NO;
+    _displayLink.paused = YES;
+    [_displayLink invalidate];
+    _displayLink = nil;
+    dispatch_async(_tcpQueue, ^{
+        if (self->_sockFD >= 0) {
+            shutdown(self->_sockFD, SHUT_RDWR);
+            close(self->_sockFD);
+            self->_sockFD = -1;
+        }
+    });
+    VCAMAppendSBLog(@"colorpicker stop");
+}
+
+// ─── 截屏 → 平均 RGB ──────────────────────────────────────────────────────────
+- (void)_tick:(CADisplayLink *)link {
+    if (!_running) { link.paused = YES; return; }
+
+    CGFloat screenW = [UIScreen mainScreen].bounds.size.width;
+    CGFloat screenH = [UIScreen mainScreen].bounds.size.height;
+    CGFloat cx      = (screenW - 10.0) / 2.0;
+    CGFloat cy      = 100.0;  // 距顶部 100pt，避开刘海/状态栏
+
+    uint8_t pixels[10 * 10 * 4];
+    memset(pixels, 0, sizeof(pixels));
+
+    // 优先：UIGetScreenImage 抓取全屏合成图（含前台 App）
+    BOOL captured = NO;
+    if (&UIGetScreenImage != NULL) {
+        UIImage *full = UIGetScreenImage();
+        if (full && full.CGImage) {
+            CGFloat scale = full.scale > 0 ? full.scale : 1.0;
+            CGRect cropPx = CGRectMake(cx * scale, cy * scale, 10 * scale, 10 * scale);
+            CGImageRef cropped = CGImageCreateWithImageInRect(full.CGImage, cropPx);
+            if (cropped) {
+                CGColorSpaceRef cs  = CGColorSpaceCreateDeviceRGB();
+                CGContextRef    ctx = CGBitmapContextCreate(pixels, 10, 10, 8, 40, cs,
+                    kCGBitmapByteOrderDefault | kCGImageAlphaNoneSkipLast);
+                CGColorSpaceRelease(cs);
+                if (ctx) { CGContextDrawImage(ctx, CGRectMake(0,0,10,10), cropped); CGContextRelease(ctx); captured = YES; }
+                CGImageRelease(cropped);
+            }
+        }
+    }
+
+    // 回退：从 SpringBoard 窗口层渲染（仅 SB 自身 UI，无法抓前台 App）
+    if (!captured) {
+        UIGraphicsBeginImageContextWithOptions(CGSizeMake(10, 10), YES, 1.0);
+        CGContextRef ctx = UIGraphicsGetCurrentContext();
+        if (ctx) {
+            CGContextTranslateCTM(ctx, -cx, -cy);
+            for (UIWindow *w in [[UIApplication sharedApplication] windows])
+                [w drawViewHierarchyInRect:CGRectMake(0, 0, screenW, screenH) afterScreenUpdates:NO];
+        }
+        UIImage *snap = UIGraphicsGetImageFromCurrentImageContext();
+        UIGraphicsEndImageContext();
+        if (snap && snap.CGImage) {
+            CGColorSpaceRef cs  = CGColorSpaceCreateDeviceRGB();
+            CGContextRef    ctx2 = CGBitmapContextCreate(pixels, 10, 10, 8, 40, cs,
+                kCGBitmapByteOrderDefault | kCGImageAlphaNoneSkipLast);
+            CGColorSpaceRelease(cs);
+            if (ctx2) { CGContextDrawImage(ctx2, CGRectMake(0,0,10,10), snap.CGImage); CGContextRelease(ctx2); captured = YES; }
+        }
+    }
+
+    if (!captured) return;
+
+    // 计算 100 像素平均 RGB
+    uint32_t sumR = 0, sumG = 0, sumB = 0;
+    for (int i = 0; i < 100; i++) {
+        sumR += pixels[i * 4 + 0];
+        sumG += pixels[i * 4 + 1];
+        sumB += pixels[i * 4 + 2];
+    }
+    uint8_t r = (uint8_t)(sumR / 100);
+    uint8_t g = (uint8_t)(sumG / 100);
+    uint8_t b = (uint8_t)(sumB / 100);
+
+    // JSON 推送（在 TCP 线程执行，不阻塞主线程）
+    NSString *json = [NSString stringWithFormat:@"{\"r\":%u,\"g\":%u,\"b\":%u}\n",
+                      (unsigned)r, (unsigned)g, (unsigned)b];
+    NSData *payload  = [json dataUsingEncoding:NSUTF8StringEncoding];
+    NSString *host   = [_host copy];
+
+    dispatch_async(_tcpQueue, ^{
+        [self _ensureConnected:host];
+        [self _sendData:payload];
+    });
+}
+
+// ─── TCP 工具 ─────────────────────────────────────────────────────────────────
+- (void)_ensureConnected:(NSString *)host {
+    if (_sockFD >= 0) return;
+    _sockFD = VCAMSBConnectWithTimeout(host.UTF8String, kVCAMColorPickerPort, 2);
+    if (_sockFD < 0) {
+        VCAMAppendSBLog([NSString stringWithFormat:
+            @"colorpicker connect failed host=%@ port=%d errno=%d", host, kVCAMColorPickerPort, errno]);
+    } else {
+        int opt = 1;
+        setsockopt(_sockFD, SOL_SOCKET, SO_NOSIGPIPE, &opt, sizeof(opt));
+        VCAMAppendSBLog([NSString stringWithFormat:
+            @"colorpicker connected host=%@ port=%d", host, kVCAMColorPickerPort]);
+    }
+}
+
+- (void)_sendData:(NSData *)data {
+    if (!data.length || _sockFD < 0) return;
+    const uint8_t *bytes = (const uint8_t *)data.bytes;
+    size_t total = data.length, sent = 0;
+    while (sent < total) {
+        ssize_t n = send(_sockFD, bytes + sent, total - sent, 0);
+        if (n <= 0) { close(_sockFD); _sockFD = -1; break; }
+        sent += (size_t)n;
+    }
+}
+
+@end
+
 // ─── VCAMManager ──────────────────────────────────────────────────────────────
 @implementation VCAMManager
 
@@ -751,6 +941,18 @@ static void VCAMSBSetSampleAttachments(CMSampleBufferRef sample) {
     self.statusLabel.text = [NSString stringWithFormat:@"\u5df2\u4fdd\u5b58: %@:%d (\u9884\u89c8\u4e2d)", host, port];
 }
 
+- (void)onColorPickerTap:(UIButton *)sender {
+    [[VCAMColorPickerSender shared] toggle];
+    BOOL nowRunning = [VCAMColorPickerSender shared].running;
+    NSString *title = nowRunning ? @"\u5173\u95ed\u95ea\u8272\u6293\u53d6 (Color Picker)"
+                                 : @"\u5f00\u542f\u95ea\u8272\u6293\u53d6 (Color Picker)";
+    [sender setTitle:title forState:UIControlStateNormal];
+    sender.backgroundColor = nowRunning
+        ? [UIColor colorWithRed:0.50 green:0.20 blue:0.12 alpha:1]
+        : [UIColor colorWithRed:0.12 green:0.28 blue:0.50 alpha:1];
+    VCAMAppendSBLog([NSString stringWithFormat:@"colorpicker toggled running=%d", nowRunning?1:0]);
+}
+
 - (void)onCancelTap {
     [self vcam_finishEditing];
     [self.previewTimer invalidate]; self.previewTimer = nil;
@@ -772,7 +974,7 @@ static void VCAMSBSetSampleAttachments(CMSampleBufferRef sample) {
     [self.view addSubview:mask];
 
     CGRect bounds = self.view.bounds;
-    CGFloat pw = MIN(CGRectGetWidth(bounds) - 28, 360), ph = 468;
+    CGFloat pw = MIN(CGRectGetWidth(bounds) - 28, 360), ph = 510;
     UIView *panel = [[UIView alloc] initWithFrame:CGRectMake(
         (CGRectGetWidth(bounds) - pw) * 0.5, (CGRectGetHeight(bounds) - ph) * 0.5, pw, ph)];
     panel.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleRightMargin |
@@ -874,8 +1076,22 @@ static void VCAMSBSetSampleAttachments(CMSampleBufferRef sample) {
     [disableBtn addTarget:self action:@selector(onDisableTap) forControlEvents:UIControlEventTouchUpInside];
     [panel addSubview:disableBtn];
 
+    // ── 颜色抓取按钮 ──────────────────────────────────────────────────────────
+    UIButton *colorPickerBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    colorPickerBtn.frame = CGRectMake(16, 426, pw - 32, 36);
+    colorPickerBtn.backgroundColor = [UIColor colorWithRed:0.12 green:0.28 blue:0.50 alpha:1];
+    BOOL cpRunning = [VCAMColorPickerSender shared].running;
+    NSString *cpTitle = cpRunning ? @"\u5173\u95ed\u95ea\u8272\u6293\u53d6 (Color Picker)"
+                                  : @"\u5f00\u542f\u95ea\u8272\u6293\u53d6 (Color Picker)";
+    [colorPickerBtn setTitle:cpTitle forState:UIControlStateNormal];
+    [colorPickerBtn setTitleColor:[UIColor colorWithRed:0.55 green:0.85 blue:1.0 alpha:1] forState:UIControlStateNormal];
+    colorPickerBtn.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
+    colorPickerBtn.layer.cornerRadius = 9;
+    [colorPickerBtn addTarget:self action:@selector(onColorPickerTap:) forControlEvents:UIControlEventTouchUpInside];
+    [panel addSubview:colorPickerBtn];
+
     UIButton *cancelBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    cancelBtn.frame = CGRectMake(16, 426, pw - 32, 26);
+    cancelBtn.frame = CGRectMake(16, 470, pw - 32, 26);
     [cancelBtn setTitle:@"\u53d6\u6d88\u64cd\u4f5c" forState:UIControlStateNormal];
     [cancelBtn setTitleColor:[UIColor colorWithWhite:0.88 alpha:1] forState:UIControlStateNormal];
     cancelBtn.titleLabel.font = [UIFont systemFontOfSize:17];
@@ -1013,6 +1229,15 @@ static void VCAMStartShowUIObserver(void) {
     });
 }
 
+static int gColorPickerNotifyToken = 0;
+static void VCAMStartColorPickerObserver(void) {
+    if (gColorPickerNotifyToken) return;
+    notify_register_dispatch(kVCAMColorPickerToggleNotify, &gColorPickerNotifyToken,
+                             dispatch_get_main_queue(), ^(int __unused t) {
+        [[VCAMColorPickerSender shared] toggle];
+    });
+}
+
 static void VCAMHandlePhysicalButtonEvent(id event) {
     if (!gProcessIsSpringBoard || !event) return;
     BOOL up = VCAMEventLooksVolumeUp(event), down = VCAMEventLooksVolumeDown(event);
@@ -1060,6 +1285,7 @@ static void VCAMHandlePhysicalButtonEvent(id event) {
         VCAMStartVolumePoller();
         VCAMStartDarwinVolumeObserver();
         VCAMStartShowUIObserver();
+        VCAMStartColorPickerObserver();
         [VCAMManager syncAndCheckStatus];
         NSLog(@"[VCAMCloneSB] loaded in SpringBoard");
         notify_post(kVCAMMediaNotify);

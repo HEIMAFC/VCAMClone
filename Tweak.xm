@@ -31,6 +31,13 @@ static uint64_t        gVCAMHookProbeCount     = 0;
 static CMTime         gLastReplacedPTS = {0, 0, 0, 0};
 static os_unfair_lock g_ptsLock        = OS_UNFAIR_LOCK_INIT;
 
+// ── 帧渲染缓存（缓存 + CPU Memcpy 架构）─────────────────────────────────────────
+//  同一张网络帧图片只做一次 GPU/CPU 渲染，后续所有调用直接 memcpy，
+//  彻底杜绝录像模式 VideoToolbox 高频调用引发的 GPU 死锁。
+static CGImageRef       gLastRenderedFakeImage = NULL;  // 裸指针比较键，不持有引用
+static CVPixelBufferRef gCachedScaledBuffer    = NULL;  // 持有引用
+static os_unfair_lock   g_cacheLock            = OS_UNFAIR_LOCK_INIT;
+
 // ─── TCP helpers ──────────────────────────────────────────────────────────────
 static BOOL VCAMReadExact(int fd, void *buffer, size_t length) {
     uint8_t *ptr = (uint8_t *)buffer;
@@ -200,6 +207,40 @@ static CVPixelBufferRef VCAMCreatePixelBufferFromJPEGData(NSData *jpegData) {
     return buf;
 }
 
+// ─── 平面感知 CPU memcpy（NV12 双平面 / BGRA 单平面均适用）──────────────────────
+static void VCAMMemcpyPixelBuffer(CVPixelBufferRef dst, CVPixelBufferRef src) {
+    if (!dst || !src) return;
+    CVPixelBufferLockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
+    CVPixelBufferLockBaseAddress(dst, 0);
+    if (CVPixelBufferIsPlanar(src)) {
+        size_t planes = CVPixelBufferGetPlaneCount(src);
+        for (size_t p = 0; p < planes; p++) {
+            const uint8_t *sb = (const uint8_t *)CVPixelBufferGetBaseAddressOfPlane(src, p);
+            uint8_t       *db = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(dst, p);
+            if (!sb || !db) continue;
+            size_t srcBPR = CVPixelBufferGetBytesPerRowOfPlane(src, p);
+            size_t dstBPR = CVPixelBufferGetBytesPerRowOfPlane(dst, p);
+            size_t h      = CVPixelBufferGetHeightOfPlane(src, p);
+            size_t rowB   = MIN(srcBPR, dstBPR);
+            for (size_t row = 0; row < h; row++)
+                memcpy(db + row * dstBPR, sb + row * srcBPR, rowB);
+        }
+    } else {
+        const uint8_t *sb = (const uint8_t *)CVPixelBufferGetBaseAddress(src);
+        uint8_t       *db = (uint8_t *)CVPixelBufferGetBaseAddress(dst);
+        if (sb && db) {
+            size_t srcBPR = CVPixelBufferGetBytesPerRow(src);
+            size_t dstBPR = CVPixelBufferGetBytesPerRow(dst);
+            size_t h      = CVPixelBufferGetHeight(src);
+            size_t rowB   = MIN(srcBPR, dstBPR);
+            for (size_t row = 0; row < h; row++)
+                memcpy(db + row * dstBPR, sb + row * srcBPR, rowB);
+        }
+    }
+    CVPixelBufferUnlockBaseAddress(dst, 0);
+    CVPixelBufferUnlockBaseAddress(src, kCVPixelBufferLock_ReadOnly);
+}
+
 // ─── 原地覆写 ────────────────────────────────────────────────────────────────
 //
 //  关键原理：iPhone 物理传感器横向（landscape）安装。
@@ -221,7 +262,7 @@ static BOOL VCAMReplacePixelsInPlace(CGImageRef fakeImage, CVPixelBufferRef real
 
     if (!srcW || !srcH || !dstW || !dstH) return NO;
 
-    // 横向缓冲区（物理传感器自然方向）需要预旋转 -90° 补偿系统方向附件
+    // 横向缓冲区（物理传感器自然方向）需要预旋转补偿系统方向附件
     BOOL needsRotation = (dstW > dstH);
 
     static uint64_t sReplaceCount = 0;
@@ -232,13 +273,44 @@ static BOOL VCAMReplacePixelsInPlace(CGImageRef fakeImage, CVPixelBufferRef real
             (unsigned long long)sReplaceCount, srcW, srcH, dstW, dstH,
             (unsigned)dstFmt, (int)needsRotation]);
 
+    // ── 缓存检查：同一张图 + 相同尺寸/格式 → 直接 CPU memcpy，零 GPU ────────────
+    os_unfair_lock_lock(&g_cacheLock);
+    BOOL cacheHit = (gLastRenderedFakeImage == fakeImage)
+                 && gCachedScaledBuffer
+                 && (CVPixelBufferGetWidth(gCachedScaledBuffer)           == dstW)
+                 && (CVPixelBufferGetHeight(gCachedScaledBuffer)          == dstH)
+                 && (CVPixelBufferGetPixelFormatType(gCachedScaledBuffer) == dstFmt);
+    CVPixelBufferRef cachedBuf = cacheHit
+        ? (CVPixelBufferRef)CFRetain(gCachedScaledBuffer) : NULL;
+    os_unfair_lock_unlock(&g_cacheLock);
+
+    if (cachedBuf) {
+        VCAMMemcpyPixelBuffer(realBuf, cachedBuf);
+        CFRelease(cachedBuf);
+        if (sReplaceCount <= 5) VCAMAppendMediaLog(@"replace cache-hit memcpy ok");
+        return YES;
+    }
+
+    // ── 缓存未命中：创建与 realBuf 同格式/尺寸的私有 buffer ─────────────────────
+    NSDictionary *cacheAttrs = @{
+        (id)kCVPixelBufferPixelFormatTypeKey:     @(dstFmt),
+        (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
+    };
+    CVPixelBufferRef newCache = NULL;
+    CVReturn cvRet = CVPixelBufferCreate(kCFAllocatorDefault, dstW, dstH, dstFmt,
+                                         (__bridge CFDictionaryRef)cacheAttrs, &newCache);
+    // 渲染目标：优先写入 newCache；若创建失败则 fallback 直接写 realBuf（原始行为）
+    CVPixelBufferRef renderTarget = (cvRet == kCVReturnSuccess && newCache) ? newCache : realBuf;
+
+    BOOL rendered = NO;
+
     if (dstFmt == kCVPixelFormatType_32BGRA || dstFmt == kCVPixelFormatType_32ARGB) {
-        // ── 路径 A：CGBitmapContext 快速 CPU 覆写 ─────────────────────────────
-        CVPixelBufferLockBaseAddress(realBuf, 0);
+        // ── 路径 A：CGBitmapContext 纯 CPU 渲染 ──────────────────────────────
+        CVPixelBufferLockBaseAddress(renderTarget, 0);
         CGColorSpaceRef cs  = CGColorSpaceCreateDeviceRGB();
         CGContextRef    ctx = CGBitmapContextCreate(
-            CVPixelBufferGetBaseAddress(realBuf), dstW, dstH, 8,
-            CVPixelBufferGetBytesPerRow(realBuf), cs,
+            CVPixelBufferGetBaseAddress(renderTarget), dstW, dstH, 8,
+            CVPixelBufferGetBytesPerRow(renderTarget), cs,
             kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst);
         CGColorSpaceRelease(cs);
         if (ctx) {
@@ -266,50 +338,68 @@ static BOOL VCAMReplacePixelsInPlace(CGImageRef fakeImage, CVPixelBufferRef real
                     fakeImage);
             }
             CGContextRelease(ctx);
+            rendered = YES;
         }
-        CVPixelBufferUnlockBaseAddress(realBuf, 0);
-        if (sReplaceCount <= 5) VCAMAppendMediaLog(@"replace A (BGRA) ok");
-        return YES;
+        CVPixelBufferUnlockBaseAddress(renderTarget, 0);
+        if (rendered && sReplaceCount <= 5) VCAMAppendMediaLog(@"replace A (BGRA) cache-miss ok");
+    } else {
+        // ── 路径 B：CIContext GPU 渲染（缓存未命中时每新帧只执行一次）──────────
+        @autoreleasepool {
+            CIImage *ci = [CIImage imageWithCGImage:fakeImage];
+            if (!ci) {
+                if (sReplaceCount <= 5) VCAMAppendMediaLog(@"CIImage nil");
+            } else {
+                CIContext *ctx = VCAMSharedCIContext();
+                if (!ctx) {
+                    if (sReplaceCount <= 5) VCAMAppendMediaLog(@"CIContext nil");
+                } else {
+                    if (needsRotation) {
+                        // 旋转 +90° 补偿横向传感器方向附件（与路径 A 方向一致）
+                        ci = [ci imageByApplyingTransform:CGAffineTransformMakeRotation(M_PI_2)];
+                        // 归一化原点到 (0, 0)
+                        CGRect ext = ci.extent;
+                        if (ext.origin.x != 0 || ext.origin.y != 0)
+                            ci = [ci imageByApplyingTransform:
+                                    CGAffineTransformMakeTranslation(-ext.origin.x, -ext.origin.y)];
+                    }
+                    CGRect ext = ci.extent;
+                    if (ext.size.width > 0 && ext.size.height > 0) {
+                        // 等比放大 + 居中裁切到目标尺寸
+                        CGFloat fill    = MAX((CGFloat)dstW / ext.size.width,
+                                              (CGFloat)dstH / ext.size.height);
+                        CIImage *scaled = [ci imageByApplyingTransform:
+                                            CGAffineTransformMakeScale(fill, fill)];
+                        CGRect   se     = scaled.extent;
+                        CGRect   crop   = CGRectMake(
+                            se.origin.x + (se.size.width  - (CGFloat)dstW) * 0.5,
+                            se.origin.y + (se.size.height - (CGFloat)dstH) * 0.5,
+                            (CGFloat)dstW, (CGFloat)dstH);
+                        CIImage *positioned = [[scaled imageByCroppingToRect:crop]
+                            imageByApplyingTransform:
+                                CGAffineTransformMakeTranslation(-crop.origin.x, -crop.origin.y)];
+                        [ctx render:positioned toCVPixelBuffer:renderTarget];
+                        rendered = YES;
+                    }
+                }
+            }
+        }
+        if (rendered && sReplaceCount <= 5) VCAMAppendMediaLog(@"replace B (CIContext) cache-miss ok");
     }
 
-    // ── 路径 B：CIContext 渲染到 NV12/YpCbCr 等格式 ──────────────────────────
-    @autoreleasepool {
-        CIImage *ci = [CIImage imageWithCGImage:fakeImage];
-        if (!ci) { if (sReplaceCount <= 5) VCAMAppendMediaLog(@"CIImage nil"); return NO; }
-
-        CIContext *ctx = VCAMSharedCIContext();
-        if (!ctx) { if (sReplaceCount <= 5) VCAMAppendMediaLog(@"CIContext nil"); return NO; }
-
-        if (needsRotation) {
-            // 旋转 +90° 补偿横向传感器方向附件（与路径 A 方向一致）
-            ci = [ci imageByApplyingTransform:CGAffineTransformMakeRotation(M_PI_2)];
-            // 归一化原点到 (0, 0)
-            CGRect ext = ci.extent;
-            if (ext.origin.x != 0 || ext.origin.y != 0)
-                ci = [ci imageByApplyingTransform:
-                        CGAffineTransformMakeTranslation(-ext.origin.x, -ext.origin.y)];
-        }
-
-        CGRect ext = ci.extent;
-        if (ext.size.width <= 0 || ext.size.height <= 0) return NO;
-
-        // 等比放大 + 居中裁切到目标尺寸
-        CGFloat fill    = MAX((CGFloat)dstW / ext.size.width,
-                              (CGFloat)dstH / ext.size.height);
-        CIImage *scaled = [ci imageByApplyingTransform:CGAffineTransformMakeScale(fill, fill)];
-        CGRect   se     = scaled.extent;
-        CGRect   crop   = CGRectMake(
-            se.origin.x + (se.size.width  - (CGFloat)dstW) * 0.5,
-            se.origin.y + (se.size.height - (CGFloat)dstH) * 0.5,
-            (CGFloat)dstW, (CGFloat)dstH);
-        CIImage *positioned = [[scaled imageByCroppingToRect:crop]
-            imageByApplyingTransform:
-                CGAffineTransformMakeTranslation(-crop.origin.x, -crop.origin.y)];
-
-        [ctx render:positioned toCVPixelBuffer:realBuf];
-        if (sReplaceCount <= 5) VCAMAppendMediaLog(@"replace B (CIContext) ok");
-        return YES;
+    if (rendered && newCache) {
+        // 更新缓存（新帧渲染完毕后缓存结果）
+        os_unfair_lock_lock(&g_cacheLock);
+        if (gCachedScaledBuffer) { CFRelease(gCachedScaledBuffer); gCachedScaledBuffer = NULL; }
+        gCachedScaledBuffer    = (CVPixelBufferRef)CFRetain(newCache);
+        gLastRenderedFakeImage = fakeImage;  // 裸指针，不 retain，仅作 key 比较
+        os_unfair_lock_unlock(&g_cacheLock);
+        // 将 newCache 内容 memcpy 到真正的系统 realBuf
+        VCAMMemcpyPixelBuffer(realBuf, newCache);
     }
+    // renderTarget == realBuf（fallback）时数据已直接写入，无需 memcpy
+
+    if (newCache) CFRelease(newCache);
+    return rendered;
 }
 
 // ─── The actual hook function ─────────────────────────────────────────────────
