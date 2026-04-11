@@ -195,13 +195,14 @@ static CVPixelBufferRef VCAMCreatePixelBufferFromJPEGData(NSData *jpegData) {
     return buf;
 }
 
-// ─── 原地覆写（保留原版快速路径，仅源图像 EXIF 已在网络线程修正）─────────────────
+// ─── 原地覆写 ────────────────────────────────────────────────────────────────
 //
-//  路径 A (BGRA)   → CGBitmapContext 直接覆写，纯 CPU，~1-2ms/帧，不阻塞相机线程
-//  路径 B (NV12…) → CIContext render:toCVPixelBuffer:，GPU，同原版
-//                   修复：去掉会导致 encoder 死锁的 ReadOnly lock/unlock
-//                   改用 [CIContext render:toCVPixelBuffer:bounds:colorSpace:] 精确对齐
+//  关键原理：iPhone 物理传感器横向（landscape）安装。
+//  当 dstW > dstH（横向缓冲区）时，系统方向元数据会在保存/编码阶段再额外旋转 +90°。
+//  因此必须在画图前预先旋转 -90°，让系统 +90° 旋转后还原为正向。
 //
+//  路径 A (BGRA)  → CGBitmapContext 纯 CPU，~1-2ms/帧，不阻塞相机线程
+//  路径 B (YUV…) → CIContext GPU 渲染，同原版
 //  比例策略：Aspect-Fill 居中裁切
 // ─────────────────────────────────────────────────────────────────────────────
 static BOOL VCAMReplacePixelsInPlace(CGImageRef fakeImage, CVPixelBufferRef realBuf) {
@@ -215,27 +216,19 @@ static BOOL VCAMReplacePixelsInPlace(CGImageRef fakeImage, CVPixelBufferRef real
 
     if (!srcW || !srcH || !dstW || !dstH) return NO;
 
-    // Aspect-Fill：等比放大到刚好能覆盖目标
-    CGFloat fillScale = MAX((CGFloat)dstW / (CGFloat)srcW,
-                            (CGFloat)dstH / (CGFloat)srcH);
-    CGFloat scaledW   = srcW * fillScale;
-    CGFloat scaledH   = srcH * fillScale;
+    // 横向缓冲区（物理传感器自然方向）需要预旋转 -90° 补偿系统方向附件
+    BOOL needsRotation = (dstW > dstH);
 
     static uint64_t sReplaceCount = 0;
     sReplaceCount++;
     if (sReplaceCount <= 5 || (sReplaceCount % 300) == 0)
         VCAMAppendMediaLog([NSString stringWithFormat:
-            @"replace#=%llu src=%zux%zu dst=%zux%zu fmt=%u scale=%.2f",
+            @"replace#=%llu src=%zux%zu dst=%zux%zu fmt=%u rot=%d",
             (unsigned long long)sReplaceCount, srcW, srcH, dstW, dstH,
-            (unsigned)dstFmt, fillScale]);
+            (unsigned)dstFmt, (int)needsRotation]);
 
     if (dstFmt == kCVPixelFormatType_32BGRA || dstFmt == kCVPixelFormatType_32ARGB) {
         // ── 路径 A：CGBitmapContext 快速 CPU 覆写 ─────────────────────────────
-        CGRect drawRect = CGRectMake(
-            -(scaledW - (CGFloat)dstW) * 0.5,
-            -(scaledH - (CGFloat)dstH) * 0.5,
-            scaledW, scaledH);
-
         CVPixelBufferLockBaseAddress(realBuf, 0);
         CGColorSpaceRef cs  = CGColorSpaceCreateDeviceRGB();
         CGContextRef    ctx = CGBitmapContextCreate(
@@ -245,9 +238,28 @@ static BOOL VCAMReplacePixelsInPlace(CGImageRef fakeImage, CVPixelBufferRef real
         CGColorSpaceRelease(cs);
         if (ctx) {
             CGContextSetBlendMode(ctx, kCGBlendModeCopy);
-            CGContextClearRect(ctx, CGRectMake(0, 0, (CGFloat)dstW, (CGFloat)dstH));
             CGContextClipToRect(ctx, CGRectMake(0, 0, (CGFloat)dstW, (CGFloat)dstH));
-            CGContextDrawImage(ctx, drawRect, fakeImage);
+            if (needsRotation) {
+                // 1. 平移原点至画布中心
+                CGContextTranslateCTM(ctx, (CGFloat)dstW / 2.0, (CGFloat)dstH / 2.0);
+                // 2. 旋转 -90°（若照片方向仍反，改为 +M_PI_2）
+                CGContextRotateCTM(ctx, -M_PI_2);
+                // 3. 旋转后有效画布为 dstH 宽 × dstW 高（竖向坐标系），按此做 Aspect-Fill
+                CGFloat fill = MAX((CGFloat)dstH / (CGFloat)srcW,
+                                   (CGFloat)dstW / (CGFloat)srcH);
+                CGFloat fw = (CGFloat)srcW * fill;
+                CGFloat fh = (CGFloat)srcH * fill;
+                CGContextDrawImage(ctx, CGRectMake(-fw * 0.5, -fh * 0.5, fw, fh), fakeImage);
+            } else {
+                CGFloat fill = MAX((CGFloat)dstW / (CGFloat)srcW,
+                                   (CGFloat)dstH / (CGFloat)srcH);
+                CGFloat fw = (CGFloat)srcW * fill;
+                CGFloat fh = (CGFloat)srcH * fill;
+                CGContextDrawImage(ctx,
+                    CGRectMake(-(fw - (CGFloat)dstW) * 0.5,
+                               -(fh - (CGFloat)dstH) * 0.5, fw, fh),
+                    fakeImage);
+            }
             CGContextRelease(ctx);
         }
         CVPixelBufferUnlockBaseAddress(realBuf, 0);
@@ -263,10 +275,25 @@ static BOOL VCAMReplacePixelsInPlace(CGImageRef fakeImage, CVPixelBufferRef real
         CIContext *ctx = VCAMSharedCIContext();
         if (!ctx) { if (sReplaceCount <= 5) VCAMAppendMediaLog(@"CIContext nil"); return NO; }
 
+        if (needsRotation) {
+            // 旋转 -90° 补偿横向传感器方向附件
+            ci = [ci imageByApplyingTransform:CGAffineTransformMakeRotation(-M_PI_2)];
+            // 归一化原点到 (0, 0)
+            CGRect ext = ci.extent;
+            if (ext.origin.x != 0 || ext.origin.y != 0)
+                ci = [ci imageByApplyingTransform:
+                        CGAffineTransformMakeTranslation(-ext.origin.x, -ext.origin.y)];
+        }
+
+        CGRect ext = ci.extent;
+        if (ext.size.width <= 0 || ext.size.height <= 0) return NO;
+
         // 等比放大 + 居中裁切到目标尺寸
-        CIImage *scaled  = [ci imageByApplyingTransform:CGAffineTransformMakeScale(fillScale, fillScale)];
-        CGRect   se      = scaled.extent;
-        CGRect   crop    = CGRectMake(
+        CGFloat fill    = MAX((CGFloat)dstW / ext.size.width,
+                              (CGFloat)dstH / ext.size.height);
+        CIImage *scaled = [ci imageByApplyingTransform:CGAffineTransformMakeScale(fill, fill)];
+        CGRect   se     = scaled.extent;
+        CGRect   crop   = CGRectMake(
             se.origin.x + (se.size.width  - (CGFloat)dstW) * 0.5,
             se.origin.y + (se.size.height - (CGFloat)dstH) * 0.5,
             (CGFloat)dstW, (CGFloat)dstH);
@@ -274,14 +301,7 @@ static BOOL VCAMReplacePixelsInPlace(CGImageRef fakeImage, CVPixelBufferRef real
             imageByApplyingTransform:
                 CGAffineTransformMakeTranslation(-crop.origin.x, -crop.origin.y)];
 
-        // render with explicit bounds/color space so VideoToolbox-facing buffers keep stable layout
-        CGColorSpaceRef renderCS = CGColorSpaceCreateDeviceRGB();
-        [ctx render:positioned
-    toCVPixelBuffer:realBuf
-              bounds:CGRectMake(0, 0, (CGFloat)dstW, (CGFloat)dstH)
-          colorSpace:renderCS];
-        CGColorSpaceRelease(renderCS);
-
+        [ctx render:positioned toCVPixelBuffer:realBuf];
         if (sReplaceCount <= 5) VCAMAppendMediaLog(@"replace B (CIContext) ok");
         return YES;
     }
