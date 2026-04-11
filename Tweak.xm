@@ -108,7 +108,7 @@ static void VCAMAppendMediaLog(NSString *line)   { VCAMAppendLog(kVCAMMediaLogPa
 - (void)stop;
 - (CMSampleBufferRef)copyLatestSampleBuffer;
 - (CVImageBufferRef)copyLatestImageBuffer;
-- (CIImage *)copyLatestCIImage;   // ← 供原地覆写路径使用（已含 EXIF 方向校正）
+- (CGImageRef)copyLatestCGImage;  // +1 ref，调用方负责 CGImageRelease
 @end
 
 @interface VCAMService : NSObject
@@ -119,14 +119,14 @@ static void VCAMAppendMediaLog(NSString *line)   { VCAMAppendLog(kVCAMMediaLogPa
 - (void)ensureReceiverStartedIfNeeded;
 - (CMSampleBufferRef)copyLatestSampleBuffer;
 - (CVImageBufferRef)copyLatestImageBuffer;
-- (CIImage *)copyLatestCIImage;
+- (CGImageRef)copyLatestCGImage;
 @end
 
 @interface VCAMManager : NSObject
 + (void)syncAndCheckStatus;
 + (CMSampleBufferRef)copyLatestSampleBuffer;
 + (CVImageBufferRef)copyLatestImageBuffer;
-+ (CIImage *)copyLatestCIImage;
++ (CGImageRef)copyLatestCGImage;
 @end
 
 // ─── 共享 CIContext ───────────────────────────────────────────────────────────
@@ -140,22 +140,43 @@ static CIContext *VCAMSharedCIContext(void) {
     return sCtx;
 }
 
-// ─── JPEG → CVPixelBufferRef（修复：用 CIImage 处理 EXIF 方向）─────────────────
+static void VCAMNormalizeOrientationAttachments(CMSampleBufferRef sampleBuffer, CVImageBufferRef imageBuffer) {
+    int32_t up = 1;
+    CFNumberRef orientationUp = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &up);
+    if (!orientationUp) return;
+    if (sampleBuffer) {
+        CMSetAttachment(sampleBuffer, kCGImagePropertyOrientation, orientationUp, kCMAttachmentMode_ShouldPropagate);
+    }
+    if (imageBuffer) {
+        CVBufferSetAttachment(imageBuffer, kCGImagePropertyOrientation, orientationUp, kCVAttachmentMode_ShouldPropagate);
+    }
+    CFRelease(orientationUp);
+}
+
+// ─── JPEG → CVPixelBufferRef（修复：网络线程预处理 EXIF，hook 线程不碰 GPU）──────
 //
 //  旧版用 CGImageCreateWithJPEGDataProvider，完全忽略 EXIF 方向，
-//  导致竖屏 JPEG 被以横屏原始布局写入 buffer（旋转 90°）。
-//  CIImage imageWithData: 自动读取 EXIF 并校正坐标系，
-//  CIContext render:toCVPixelBuffer: 处理坐标翻转，输出正确朝向的 BGRA buffer。
+//  导致竖屏 JPEG 以横屏原始布局存入 buffer（旋转 90°、深度检测失败→高斯模糊）。
+//
+//  修复：
+//    1. [CIImage imageWithData:] 自动应用 EXIF 方向（在网络接收线程执行，不影响相机线程）
+//    2. [CIContext createCGImage:fromRect:] 转为标准 CGImage（CG 坐标系，与后续
+//       CGContextDrawImage 完全兼容，保留原来快速 CPU 路径）
+//    3. Hook 里仍用原来的 CGContextDrawImage（快速 CPU），不引入 GPU 延迟
 // ─────────────────────────────────────────────────────────────────────────────
 static CVPixelBufferRef VCAMCreatePixelBufferFromJPEGData(NSData *jpegData) {
     if (!jpegData.length) return NULL;
 
-    CIImage *ci = [CIImage imageWithData:jpegData];  // 自动应用 EXIF 方向
+    // 步骤 1: CIImage 读取 EXIF 并自动校正朝向（网络线程执行，不影响相机线程帧率）
+    CIImage *ci = [CIImage imageWithData:jpegData];
     if (!ci) return NULL;
 
-    size_t w = (size_t)ci.extent.size.width;
-    size_t h = (size_t)ci.extent.size.height;
-    if (w == 0 || h == 0) return NULL;
+    // 步骤 2: 转为 CGImage（CG 坐标系，EXIF 已烘入像素，尺寸已是校正后的尺寸）
+    CGImageRef cgImage = [VCAMSharedCIContext() createCGImage:ci fromRect:ci.extent];
+    if (!cgImage) return NULL;
+
+    size_t w = CGImageGetWidth(cgImage);
+    size_t h = CGImageGetHeight(cgImage);
 
     NSDictionary *attrs = @{
         (id)kCVPixelBufferPixelFormatTypeKey:              @(kCVPixelFormatType_32BGRA),
@@ -166,73 +187,110 @@ static CVPixelBufferRef VCAMCreatePixelBufferFromJPEGData(NSData *jpegData) {
 
     CVPixelBufferRef buf = NULL;
     if (CVPixelBufferCreate(kCFAllocatorDefault, w, h, kCVPixelFormatType_32BGRA,
-                            (__bridge CFDictionaryRef)attrs, &buf) != kCVReturnSuccess || !buf)
-        return NULL;
+                            (__bridge CFDictionaryRef)attrs, &buf) != kCVReturnSuccess || !buf) {
+        CGImageRelease(cgImage); return NULL;
+    }
 
-    [VCAMSharedCIContext() render:ci toCVPixelBuffer:buf];
+    // 步骤 3: 用 CGContextDrawImage 写入（与原始流程完全一致，保留 CG 坐标约定）
+    CVPixelBufferLockBaseAddress(buf, 0);
+    CGColorSpaceRef cs  = CGColorSpaceCreateDeviceRGB();
+    CGContextRef    ctx = CGBitmapContextCreate(
+        CVPixelBufferGetBaseAddress(buf), w, h, 8,
+        CVPixelBufferGetBytesPerRow(buf), cs,
+        kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst);
+    CGColorSpaceRelease(cs);
+    if (ctx) {
+        CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), cgImage);
+        CGContextRelease(ctx);
+    }
+    CVPixelBufferUnlockBaseAddress(buf, 0);
+    CGImageRelease(cgImage);
     return buf;
 }
 
-// ─── 原地覆写（核心修复）─────────────────────────────────────────────────────
+// ─── 原地覆写（保留原版快速路径，仅源图像 EXIF 已在网络线程修正）─────────────────
 //
-//  旧版两条路径的问题：
-//    路径 A (BGRA) — CGContextDrawImage 无坐标翻转，数据上下颠倒
-//    路径 B (YUV)  — CIImage imageWithCGImage: 不处理 EXIF 方向
+//  路径 A (BGRA)   → CGBitmapContext 直接覆写，纯 CPU，~1-2ms/帧，不阻塞相机线程
+//  路径 B (NV12…) → CIContext render:toCVPixelBuffer:，GPU，同原版
+//                   修复：去掉会导致 encoder 死锁的 ReadOnly lock/unlock
+//                   改用 [CIContext render:toCVPixelBuffer:bounds:colorSpace:] 精确对齐
 //
-//  新版统一用 CIImage + CIContext：
-//    • [CIImage imageWithData:] 自动含 EXIF 校正，朝向正确
-//    • CIContext render:toCVPixelBuffer: 自动处理坐标系，支持任意格式
-//    • 保留 Aspect-Fill 居中裁切逻辑
-//    • lock/unlock ReadOnly 强制 IOSurface 同步，防录制 encoder 提前复用
+//  比例策略：Aspect-Fill 居中裁切
 // ─────────────────────────────────────────────────────────────────────────────
-static BOOL VCAMReplacePixelsInPlace(CIImage *fakeCI, CVPixelBufferRef realBuf) {
-    if (!fakeCI || !realBuf) return NO;
+static BOOL VCAMReplacePixelsInPlace(CGImageRef fakeImage, CVPixelBufferRef realBuf) {
+    if (!fakeImage || !realBuf) return NO;
 
-    CIContext *ctx = VCAMSharedCIContext();
-    if (!ctx) return NO;
+    size_t srcW   = CGImageGetWidth(fakeImage);
+    size_t srcH   = CGImageGetHeight(fakeImage);
+    size_t dstW   = CVPixelBufferGetWidth(realBuf);
+    size_t dstH   = CVPixelBufferGetHeight(realBuf);
+    OSType dstFmt = CVPixelBufferGetPixelFormatType(realBuf);
 
-    size_t  dstW   = CVPixelBufferGetWidth(realBuf);
-    size_t  dstH   = CVPixelBufferGetHeight(realBuf);
-    CGRect  extent = fakeCI.extent;
+    if (!srcW || !srcH || !dstW || !dstH) return NO;
 
-    if (extent.size.width <= 0 || extent.size.height <= 0 || !dstW || !dstH) return NO;
+    // Aspect-Fill：等比放大到刚好能覆盖目标
+    CGFloat fillScale = MAX((CGFloat)dstW / (CGFloat)srcW,
+                            (CGFloat)dstH / (CGFloat)srcH);
+    CGFloat scaledW   = srcW * fillScale;
+    CGFloat scaledH   = srcH * fillScale;
 
     static uint64_t sReplaceCount = 0;
     sReplaceCount++;
     if (sReplaceCount <= 5 || (sReplaceCount % 300) == 0)
         VCAMAppendMediaLog([NSString stringWithFormat:
-            @"replace#=%llu src=%.0fx%.0f dst=%zux%zu fmt=%u",
-            (unsigned long long)sReplaceCount,
-            extent.size.width, extent.size.height,
-            dstW, dstH,
-            (unsigned)CVPixelBufferGetPixelFormatType(realBuf)]);
+            @"replace#=%llu src=%zux%zu dst=%zux%zu fmt=%u scale=%.2f",
+            (unsigned long long)sReplaceCount, srcW, srcH, dstW, dstH,
+            (unsigned)dstFmt, fillScale]);
 
-    // 1. Aspect-Fill：等比放大到覆盖目标
-    CGFloat fillScale = MAX((CGFloat)dstW / extent.size.width,
-                            (CGFloat)dstH / extent.size.height);
-    CIImage *scaled   = [fakeCI imageByApplyingTransform:CGAffineTransformMakeScale(fillScale, fillScale)];
+    if (dstFmt == kCVPixelFormatType_32BGRA || dstFmt == kCVPixelFormatType_32ARGB) {
+        // ── 路径 A：CGBitmapContext 快速 CPU 覆写 ─────────────────────────────
+        CGRect drawRect = CGRectMake(
+            -(scaledW - (CGFloat)dstW) * 0.5,
+            -(scaledH - (CGFloat)dstH) * 0.5,
+            scaledW, scaledH);
 
-    // 2. 居中裁切到目标尺寸
-    CGRect scaledExt  = scaled.extent;
-    CGRect cropRect   = CGRectMake(
-        scaledExt.origin.x + (scaledExt.size.width  - (CGFloat)dstW) * 0.5,
-        scaledExt.origin.y + (scaledExt.size.height - (CGFloat)dstH) * 0.5,
-        (CGFloat)dstW, (CGFloat)dstH);
-    CIImage *cropped   = [scaled imageByCroppingToRect:cropRect];
+        CVPixelBufferLockBaseAddress(realBuf, 0);
+        CGColorSpaceRef cs  = CGColorSpaceCreateDeviceRGB();
+        CGContextRef    ctx = CGBitmapContextCreate(
+            CVPixelBufferGetBaseAddress(realBuf), dstW, dstH, 8,
+            CVPixelBufferGetBytesPerRow(realBuf), cs,
+            kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipLast);
+        CGColorSpaceRelease(cs);
+        if (ctx) {
+            CGContextClipToRect(ctx, CGRectMake(0, 0, (CGFloat)dstW, (CGFloat)dstH));
+            CGContextDrawImage(ctx, drawRect, fakeImage);
+            CGContextRelease(ctx);
+        }
+        CVPixelBufferUnlockBaseAddress(realBuf, 0);
+        if (sReplaceCount <= 5) VCAMAppendMediaLog(@"replace A (BGRA) ok");
+        return YES;
+    }
 
-    // 3. 平移到 (0,0) origin，确保 render:toCVPixelBuffer: 精确填满整个 buffer
-    CIImage *positioned = [cropped imageByApplyingTransform:
-        CGAffineTransformMakeTranslation(-cropRect.origin.x, -cropRect.origin.y)];
+    // ── 路径 B：CIContext 渲染到 NV12/YpCbCr 等格式 ──────────────────────────
+    @autoreleasepool {
+        CIImage *ci = [CIImage imageWithCGImage:fakeImage];
+        if (!ci) { if (sReplaceCount <= 5) VCAMAppendMediaLog(@"CIImage nil"); return NO; }
 
-    // 4. 渲染到真实 buffer（支持 BGRA/NV12/420v/420f 等任意格式）
-    [ctx render:positioned toCVPixelBuffer:realBuf];
+        CIContext *ctx = VCAMSharedCIContext();
+        if (!ctx) { if (sReplaceCount <= 5) VCAMAppendMediaLog(@"CIContext nil"); return NO; }
 
-    // 5. IOSurface 同步：等 GPU 写完再返回，防录制线程提前复用
-    CVPixelBufferLockBaseAddress(realBuf,   kCVPixelBufferLock_ReadOnly);
-    CVPixelBufferUnlockBaseAddress(realBuf, kCVPixelBufferLock_ReadOnly);
+        // 等比放大 + 居中裁切到目标尺寸
+        CIImage *scaled  = [ci imageByApplyingTransform:CGAffineTransformMakeScale(fillScale, fillScale)];
+        CGRect   se      = scaled.extent;
+        CGRect   crop    = CGRectMake(
+            se.origin.x + (se.size.width  - (CGFloat)dstW) * 0.5,
+            se.origin.y + (se.size.height - (CGFloat)dstH) * 0.5,
+            (CGFloat)dstW, (CGFloat)dstH);
+        CIImage *positioned = [[scaled imageByCroppingToRect:crop]
+            imageByApplyingTransform:
+                CGAffineTransformMakeTranslation(-crop.origin.x, -crop.origin.y)];
 
-    if (sReplaceCount <= 5) VCAMAppendMediaLog(@"replace ok");
-    return YES;
+        // render:toCVPixelBuffer: 直接填满整个 buffer
+        [ctx render:positioned toCVPixelBuffer:realBuf];
+
+        if (sReplaceCount <= 5) VCAMAppendMediaLog(@"replace B (CIContext) ok");
+        return YES;
+    }
 }
 
 // ─── The actual hook function ─────────────────────────────────────────────────
@@ -250,9 +308,10 @@ static CVImageBufferRef VCAMHookedCMSampleBufferGetImageBuffer(CMSampleBufferRef
             originalImage ? "yes" : "null"]);
 
     if (originalImage) {
-        CIImage *fakeCI = [VCAMManager copyLatestCIImage];  // 已含 EXIF 校正
-        if (fakeCI) {
-            VCAMReplacePixelsInPlace(fakeCI, (CVPixelBufferRef)originalImage);
+        CGImageRef fakeImage = [VCAMManager copyLatestCGImage]; // +1
+        if (fakeImage) {
+            VCAMReplacePixelsInPlace(fakeImage, (CVPixelBufferRef)originalImage);
+            CGImageRelease(fakeImage);
         }
     }
 
@@ -263,7 +322,7 @@ static CVImageBufferRef VCAMHookedCMSampleBufferGetImageBuffer(CMSampleBufferRef
 @interface VCAMStreamReceiver ()
 - (void)connectLoop:(NSNumber *)generationObj;
 - (void)resetStreamStateLocked;
-- (void)storeImageBuffer:(CVImageBufferRef)imageBuffer withCIImage:(CIImage *)ci;
+- (void)storeImageBuffer:(CVImageBufferRef)imageBuffer;
 @end
 
 @implementation VCAMStreamReceiver {
@@ -276,7 +335,7 @@ static CVImageBufferRef VCAMHookedCMSampleBufferGetImageBuffer(CMSampleBufferRef
 
     CMSampleBufferRef  _latestSample;
     CVImageBufferRef   _latestImageBuffer;
-    CIImage           *_latestCIImage;   // ← 替代旧版 CGImageRef，已含 EXIF 方向校正
+    CGImageRef         _latestCGImage;   // EXIF 校正后的 CGImage，供原地覆写使用
     uint64_t           _frameCount;
     int                _connectFailCount;
 }
@@ -303,7 +362,7 @@ static CVImageBufferRef VCAMHookedCMSampleBufferGetImageBuffer(CMSampleBufferRef
 - (void)resetStreamStateLocked {
     if (_latestSample)      { CFRelease(_latestSample);      _latestSample      = NULL; }
     if (_latestImageBuffer) { CFRelease(_latestImageBuffer); _latestImageBuffer = NULL; }
-    _latestCIImage = nil;
+    if (_latestCGImage)     { CGImageRelease(_latestCGImage); _latestCGImage    = NULL; }
 }
 
 - (void)startWithHost:(NSString *)host port:(int)port {
@@ -395,17 +454,12 @@ static CVImageBufferRef VCAMHookedCMSampleBufferGetImageBuffer(CMSampleBufferRef
                             shouldContinue = NO; return;
                         }
 
-                        // ── 用 CIImage 解码 JPEG（自动处理 EXIF 方向）─────────────────
-                        CIImage *ci = [CIImage imageWithData:payload];
-
-                        // 同时构建 CVPixelBuffer + CMSampleBuffer 供 copyLatestSampleBuffer 使用
+                        // VCAMCreatePixelBufferFromJPEGData 内部已用 CIImage 校正 EXIF，
+                        // CIContext 操作在此（网络线程）完成，不占用相机回调线程的时间
                         CVPixelBufferRef pix = VCAMCreatePixelBufferFromJPEGData(payload);
                         if (pix) {
-                            [self storeImageBuffer:(CVImageBufferRef)pix withCIImage:ci];
+                            [self storeImageBuffer:(CVImageBufferRef)pix];
                             CVPixelBufferRelease(pix);
-                        } else if (ci) {
-                            // 无法建 PixelBuffer 时至少存 CIImage
-                            @synchronized (self) { _latestCIImage = ci; }
                         }
                     }
                 }
@@ -418,9 +472,25 @@ static CVImageBufferRef VCAMHookedCMSampleBufferGetImageBuffer(CMSampleBufferRef
     }
 }
 
-- (void)storeImageBuffer:(CVImageBufferRef)imageBuffer withCIImage:(CIImage *)ci {
+- (void)storeImageBuffer:(CVImageBufferRef)imageBuffer {
+    // 从 BGRA pixel buffer 提取 CGImage，供原地覆写路径使用
+    // （pixel buffer 已由 VCAMCreatePixelBufferFromJPEGData 进行 EXIF 校正）
+    CGImageRef cgImg = NULL;
+    CVPixelBufferLockBaseAddress((CVPixelBufferRef)imageBuffer, kCVPixelBufferLock_ReadOnly);
+    size_t w = CVPixelBufferGetWidth((CVPixelBufferRef)imageBuffer);
+    size_t h = CVPixelBufferGetHeight((CVPixelBufferRef)imageBuffer);
+    CGColorSpaceRef cs  = CGColorSpaceCreateDeviceRGB();
+    CGContextRef    ctx = CGBitmapContextCreate(
+        CVPixelBufferGetBaseAddress((CVPixelBufferRef)imageBuffer), w, h, 8,
+        CVPixelBufferGetBytesPerRow((CVPixelBufferRef)imageBuffer), cs,
+        kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst);
+    CGColorSpaceRelease(cs);
+    if (ctx) { cgImg = CGBitmapContextCreateImage(ctx); CGContextRelease(ctx); }
+    CVPixelBufferUnlockBaseAddress((CVPixelBufferRef)imageBuffer, kCVPixelBufferLock_ReadOnly);
+
     CMVideoFormatDescriptionRef fmt = NULL;
     if (CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, imageBuffer, &fmt) != noErr || !fmt) {
+        if (cgImg) CGImageRelease(cgImg);
         return;
     }
 
@@ -435,7 +505,10 @@ static CVImageBufferRef VCAMHookedCMSampleBufferGetImageBuffer(CMSampleBufferRef
     OSStatus st = CMSampleBufferCreateReadyWithImageBuffer(
         kCFAllocatorDefault, imageBuffer, fmt, &timing, &sample);
     CFRelease(fmt);
-    if (st != noErr || !sample) return;
+    if (st != noErr || !sample) {
+        if (cgImg) CGImageRelease(cgImg);
+        return;
+    }
 
     VCAMSetSampleAttachments(sample);
 
@@ -444,12 +517,10 @@ static CVImageBufferRef VCAMHookedCMSampleBufferGetImageBuffer(CMSampleBufferRef
         _latestImageBuffer = (CVImageBufferRef)CFRetain(imageBuffer);
         if (_latestSample)      { CFRelease(_latestSample);      _latestSample      = NULL; }
         _latestSample = sample;
-        _latestCIImage = ci;    // 已含 EXIF 校正，供 hook 路径使用
-
+        if (_latestCGImage)     { CGImageRelease(_latestCGImage); _latestCGImage    = NULL; }
+        _latestCGImage = cgImg;   // 转让所有权
         _frameCount++;
         if (_frameCount <= 3 || (_frameCount % 120) == 0) {
-            size_t w = CVPixelBufferGetWidth((CVPixelBufferRef)imageBuffer);
-            size_t h = CVPixelBufferGetHeight((CVPixelBufferRef)imageBuffer);
             VCAMAppendMediaLog([NSString stringWithFormat:
                 @"frame#=%llu size=%zux%zu", (unsigned long long)_frameCount, w, h]);
         }
@@ -470,9 +541,10 @@ static CVImageBufferRef VCAMHookedCMSampleBufferGetImageBuffer(CMSampleBufferRef
     }
 }
 
-- (CIImage *)copyLatestCIImage {
+- (CGImageRef)copyLatestCGImage {
     @synchronized (self) {
-        return _latestCIImage;  // ARC 持有，无需手动 retain
+        if (_latestCGImage) { CGImageRetain(_latestCGImage); return _latestCGImage; }
+        return NULL;
     }
 }
 
@@ -566,18 +638,18 @@ static CVImageBufferRef VCAMHookedCMSampleBufferGetImageBuffer(CMSampleBufferRef
 - (CVImageBufferRef)copyLatestImageBuffer {
     [self ensureReceiverStartedIfNeeded]; return [_receiver copyLatestImageBuffer];
 }
-- (CIImage *)copyLatestCIImage {
-    [self ensureReceiverStartedIfNeeded]; return [_receiver copyLatestCIImage];
+- (CGImageRef)copyLatestCGImage {
+    [self ensureReceiverStartedIfNeeded]; return [_receiver copyLatestCGImage];
 }
 
 @end
 
 // ─── VCAMManager ──────────────────────────────────────────────────────────────
 @implementation VCAMManager
-+ (void)syncAndCheckStatus        { [[VCAMService shared] syncAndCheckStatus]; }
++ (void)syncAndCheckStatus     { [[VCAMService shared] syncAndCheckStatus]; }
 + (CMSampleBufferRef)copyLatestSampleBuffer { return [[VCAMService shared] copyLatestSampleBuffer]; }
 + (CVImageBufferRef)copyLatestImageBuffer   { return [[VCAMService shared] copyLatestImageBuffer]; }
-+ (CIImage *)copyLatestCIImage              { return [[VCAMService shared] copyLatestCIImage]; }
++ (CGImageRef)copyLatestCGImage             { return [[VCAMService shared] copyLatestCGImage]; }
 @end
 
 // ─── Constructor ──────────────────────────────────────────────────────────────
