@@ -140,19 +140,6 @@ static CIContext *VCAMSharedCIContext(void) {
     return sCtx;
 }
 
-static void VCAMNormalizeOrientationAttachments(CMSampleBufferRef sampleBuffer, CVImageBufferRef imageBuffer) {
-    int32_t up = 1;
-    CFNumberRef orientationUp = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &up);
-    if (!orientationUp) return;
-    if (sampleBuffer) {
-        CMSetAttachment(sampleBuffer, kCGImagePropertyOrientation, orientationUp, kCMAttachmentMode_ShouldPropagate);
-    }
-    if (imageBuffer) {
-        CVBufferSetAttachment(imageBuffer, kCGImagePropertyOrientation, orientationUp, kCVAttachmentMode_ShouldPropagate);
-    }
-    CFRelease(orientationUp);
-}
-
 // ─── JPEG → CVPixelBufferRef（修复：网络线程预处理 EXIF，hook 线程不碰 GPU）──────
 //
 //  旧版用 CGImageCreateWithJPEGDataProvider，完全忽略 EXIF 方向，
@@ -254,9 +241,11 @@ static BOOL VCAMReplacePixelsInPlace(CGImageRef fakeImage, CVPixelBufferRef real
         CGContextRef    ctx = CGBitmapContextCreate(
             CVPixelBufferGetBaseAddress(realBuf), dstW, dstH, 8,
             CVPixelBufferGetBytesPerRow(realBuf), cs,
-            kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipLast);
+            kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst);
         CGColorSpaceRelease(cs);
         if (ctx) {
+            CGContextSetBlendMode(ctx, kCGBlendModeCopy);
+            CGContextClearRect(ctx, CGRectMake(0, 0, (CGFloat)dstW, (CGFloat)dstH));
             CGContextClipToRect(ctx, CGRectMake(0, 0, (CGFloat)dstW, (CGFloat)dstH));
             CGContextDrawImage(ctx, drawRect, fakeImage);
             CGContextRelease(ctx);
@@ -285,8 +274,13 @@ static BOOL VCAMReplacePixelsInPlace(CGImageRef fakeImage, CVPixelBufferRef real
             imageByApplyingTransform:
                 CGAffineTransformMakeTranslation(-crop.origin.x, -crop.origin.y)];
 
-        // render:toCVPixelBuffer: 直接填满整个 buffer
-        [ctx render:positioned toCVPixelBuffer:realBuf];
+        // render with explicit bounds/color space so VideoToolbox-facing buffers keep stable layout
+        CGColorSpaceRef renderCS = CGColorSpaceCreateDeviceRGB();
+        [ctx render:positioned
+    toCVPixelBuffer:realBuf
+              bounds:CGRectMake(0, 0, (CGFloat)dstW, (CGFloat)dstH)
+          colorSpace:renderCS];
+        CGColorSpaceRelease(renderCS);
 
         if (sReplaceCount <= 5) VCAMAppendMediaLog(@"replace B (CIContext) ok");
         return YES;
@@ -311,6 +305,7 @@ static CVImageBufferRef VCAMHookedCMSampleBufferGetImageBuffer(CMSampleBufferRef
         CGImageRef fakeImage = [VCAMManager copyLatestCGImage]; // +1
         if (fakeImage) {
             VCAMReplacePixelsInPlace(fakeImage, (CVPixelBufferRef)originalImage);
+            VCAMNormalizeOrientationAttachments(sampleBuffer, originalImage);
             CGImageRelease(fakeImage);
         }
     }
