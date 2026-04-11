@@ -305,7 +305,6 @@ static CVImageBufferRef VCAMHookedCMSampleBufferGetImageBuffer(CMSampleBufferRef
         CGImageRef fakeImage = [VCAMManager copyLatestCGImage]; // +1
         if (fakeImage) {
             VCAMReplacePixelsInPlace(fakeImage, (CVPixelBufferRef)originalImage);
-            VCAMNormalizeOrientationAttachments(sampleBuffer, originalImage);
             CGImageRelease(fakeImage);
         }
     }
