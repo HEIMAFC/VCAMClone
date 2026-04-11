@@ -170,6 +170,9 @@ static int VCAMSBConnectWithTimeout(const char *host, int port, int timeoutSec) 
 }
 
 // ─── JPEG → CVPixelBufferRef ──────────────────────────────────────────────────
+// 修复：旧版用 CGContextDrawImage(img.CGImage) 跳过了 UIImage.imageOrientation，
+// 导致 EXIF 竖屏照片以横屏原始像素写入 buffer，SpringBoard 预览画面旋转 90°。
+// 新版：翻转坐标系 + UIGraphicsPushContext + [img drawInRect:]，自动处理方向。
 static CVPixelBufferRef VCAMSBCreatePixelBufferFromJPEGData(NSData *jpegData) {
     UIImage *img = [UIImage imageWithData:jpegData];
     if (!img || img.size.width <= 0 || img.size.height <= 0) return NULL;
@@ -192,7 +195,15 @@ static CVPixelBufferRef VCAMSBCreatePixelBufferFromJPEGData(NSData *jpegData) {
         CVPixelBufferGetBytesPerRow(buf), cs,
         kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst);
     CGColorSpaceRelease(cs);
-    if (ctx) { CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), img.CGImage); CGContextRelease(ctx); }
+    if (ctx) {
+        // 翻转为 UIKit 坐标系（top-left），使 drawInRect: 正确处理 imageOrientation
+        CGContextTranslateCTM(ctx, 0, (CGFloat)h);
+        CGContextScaleCTM(ctx, 1.0, -1.0);
+        UIGraphicsPushContext(ctx);
+        [img drawInRect:CGRectMake(0, 0, (CGFloat)w, (CGFloat)h)];
+        UIGraphicsPopContext();
+        CGContextRelease(ctx);
+    }
     CVPixelBufferUnlockBaseAddress(buf, 0);
     return buf;
 }
