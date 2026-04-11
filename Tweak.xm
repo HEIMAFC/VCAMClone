@@ -5,9 +5,9 @@
 #import <CoreImage/CoreImage.h>
 #import <QuartzCore/QuartzCore.h>
 #import <ImageIO/ImageIO.h>
-#import <VideoToolbox/VideoToolbox.h>
 #import <objc/message.h>
 #import <notify.h>
+#import <os/lock.h>
 #import <substrate.h>
 #import <math.h>
 #import <arpa/inet.h>
@@ -27,11 +27,9 @@ static CVImageBufferRef (*gOrigCMSampleBufferGetImageBuffer)(CMSampleBufferRef s
 static CFTimeInterval  gVCAMLastManagerSyncAt  = 0;
 static uint64_t        gVCAMHookProbeCount     = 0;
 
-// VTCompressionSessionEncodeFrame hook — 拦截视频录制编码帧（AVCaptureMovieFileOutput 路径）
-typedef OSStatus (*VTEncodeFrameIMP)(VTCompressionSessionRef, CVImageBufferRef,
-                                     CMTime, CMTime, CFDictionaryRef, void *, VTEncodeInfoFlags *);
-static VTEncodeFrameIMP gOrigVTEncodeFrame = NULL;
-static uint64_t         gVTEncodeFrameCount = 0;
+// PTS 时间戳锁：确保同一帧最多覆写一次，防止录像模式 GPU 死锁
+static CMTime         gLastReplacedPTS = {0, 0, 0, 0};
+static os_unfair_lock g_ptsLock        = OS_UNFAIR_LOCK_INIT;
 
 // ─── TCP helpers ──────────────────────────────────────────────────────────────
 static BOOL VCAMReadExact(int fd, void *buffer, size_t length) {
@@ -315,24 +313,45 @@ static BOOL VCAMReplacePixelsInPlace(CGImageRef fakeImage, CVPixelBufferRef real
 }
 
 // ─── The actual hook function ─────────────────────────────────────────────────
+//
+//  PTS 时间戳锁：录像模式下 VideoToolbox 编码器、音频时钟、预览层会并发地
+//  对同一帧反复调用 CMSampleBufferGetImageBuffer（每帧可达 10+ 次）。
+//  若每次都触发 VCAMReplacePixelsInPlace（尤其 CIContext GPU 路径），
+//  会与硬件编码器争抢 GPU，导致 mediaserverd GPU 死锁、录像模糊卡死。
+//
+//  修复：记录上一帧 PTS，同一帧只执行一次覆写，后续并发调用直接放行。
+// ─────────────────────────────────────────────────────────────────────────────
 static CVImageBufferRef VCAMHookedCMSampleBufferGetImageBuffer(CMSampleBufferRef sampleBuffer) {
     if (!gOrigCMSampleBufferGetImageBuffer) return NULL;
     [VCAMManager syncAndCheckStatus];
 
     CVImageBufferRef originalImage = gOrigCMSampleBufferGetImageBuffer(sampleBuffer);
-    gVCAMHookProbeCount++;
-
-    if (gVCAMHookProbeCount <= 5 || (gVCAMHookProbeCount % 300) == 0)
-        VCAMAppendMediaLog([NSString stringWithFormat:
-            @"hook probe=%llu origImg=%s",
-            (unsigned long long)gVCAMHookProbeCount,
-            originalImage ? "yes" : "null"]);
 
     if (originalImage) {
-        CGImageRef fakeImage = [VCAMManager copyLatestCGImage]; // +1
-        if (fakeImage) {
-            VCAMReplacePixelsInPlace(fakeImage, (CVPixelBufferRef)originalImage);
-            CGImageRelease(fakeImage);
+        // 提取本帧唯一 PTS，防止同一帧被多线程并发覆写
+        CMTime pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
+        BOOL isNewFrame = NO;
+
+        os_unfair_lock_lock(&g_ptsLock);
+        if (pts.value != gLastReplacedPTS.value || pts.timescale != gLastReplacedPTS.timescale) {
+            gLastReplacedPTS = pts;
+            isNewFrame = YES;
+        }
+        os_unfair_lock_unlock(&g_ptsLock);
+
+        // 只有全新帧才执行覆写（每秒严格最多 30 次），解除 GPU 死锁
+        if (isNewFrame) {
+            gVCAMHookProbeCount++;
+            if (gVCAMHookProbeCount <= 5 || (gVCAMHookProbeCount % 300) == 0)
+                VCAMAppendMediaLog([NSString stringWithFormat:
+                    @"hook frame rendered=%llu",
+                    (unsigned long long)gVCAMHookProbeCount]);
+
+            CGImageRef fakeImage = [VCAMManager copyLatestCGImage]; // +1
+            if (fakeImage) {
+                VCAMReplacePixelsInPlace(fakeImage, (CVPixelBufferRef)originalImage);
+                CGImageRelease(fakeImage);
+            }
         }
     }
 
@@ -673,39 +692,6 @@ static CVImageBufferRef VCAMHookedCMSampleBufferGetImageBuffer(CMSampleBufferRef
 + (CGImageRef)copyLatestCGImage             { return [[VCAMService shared] copyLatestCGImage]; }
 @end
 
-// ─── VTCompressionSessionEncodeFrame hook ────────────────────────────────────
-//
-//  AVCaptureMovieFileOutput 录像时，视频帧直接以 CVImageBufferRef 传入 VideoToolbox
-//  编码器，完全不经过 CMSampleBufferGetImageBuffer，因此上面的 hook 对录像无效。
-//  在此截获编码入口，原地覆写像素后再交给原始编码器，录像内容同样替换为网络图像。
-//
-// ─────────────────────────────────────────────────────────────────────────────
-static OSStatus VCAMHookedVTCompressionSessionEncodeFrame(
-    VTCompressionSessionRef session,
-    CVImageBufferRef        imageBuffer,
-    CMTime                  pts,
-    CMTime                  duration,
-    CFDictionaryRef         properties,
-    void                   *sourceRef,
-    VTEncodeInfoFlags      *flags)
-{
-    if (imageBuffer) {
-        CGImageRef fake = [VCAMManager copyLatestCGImage]; // +1
-        if (fake) {
-            VCAMReplacePixelsInPlace(fake, (CVPixelBufferRef)imageBuffer);
-            CGImageRelease(fake);
-        }
-        gVTEncodeFrameCount++;
-        if (gVTEncodeFrameCount <= 5 || (gVTEncodeFrameCount % 300) == 0)
-            VCAMAppendMediaLog([NSString stringWithFormat:
-                @"VTEncode#=%llu w=%zu h=%zu",
-                (unsigned long long)gVTEncodeFrameCount,
-                CVPixelBufferGetWidth((CVPixelBufferRef)imageBuffer),
-                CVPixelBufferGetHeight((CVPixelBufferRef)imageBuffer)]);
-    }
-    return gOrigVTEncodeFrame(session, imageBuffer, pts, duration, properties, sourceRef, flags);
-}
-
 // ─── Constructor ──────────────────────────────────────────────────────────────
 %ctor {
     @autoreleasepool {
@@ -716,13 +702,6 @@ static OSStatus VCAMHookedVTCompressionSessionEncodeFrame(
                            (void *)VCAMHookedCMSampleBufferGetImageBuffer,
                            (void **)&gOrigCMSampleBufferGetImageBuffer);
             VCAMAppendProcessLog([NSString stringWithFormat:@"hook CMSampleBufferGetImageBuffer process=%@", proc]);
-        }
-        // 视频录制路径：AVCaptureMovieFileOutput → VTCompressionSessionEncodeFrame（不经过上面的 hook）
-        if (!gOrigVTEncodeFrame) {
-            MSHookFunction((void *)VTCompressionSessionEncodeFrame,
-                           (void *)VCAMHookedVTCompressionSessionEncodeFrame,
-                           (void **)&gOrigVTEncodeFrame);
-            VCAMAppendProcessLog([NSString stringWithFormat:@"hook VTCompressionSessionEncodeFrame process=%@", proc]);
         }
         [[VCAMService shared] startObserver];
         [[VCAMService shared] applyConfig];
